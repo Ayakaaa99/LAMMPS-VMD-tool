@@ -1,0 +1,23 @@
+# LAMMPS data file for Triclinic Crystal (e.g. Quartz / Tilted Cell)
+6 atoms
+2 atom types
+
+0.000 4.913 xlo xhi
+0.000 4.913 ylo yhi
+0.000 5.405 zlo zhi
+-2.4565 0.000 0.000 xy xz yz
+
+Masses
+
+1 28.0855 # Si
+2 15.9994 # O
+
+Atoms # atomic
+
+1 1 2.304 0.000 1.802
+2 1 0.000 2.304 3.603
+3 1 2.609 2.609 0.000
+4 2 2.033 1.341 2.946
+5 2 3.572 2.231 4.747
+6 2 1.239 3.572 1.145
+

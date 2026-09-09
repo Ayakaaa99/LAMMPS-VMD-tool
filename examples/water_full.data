@@ -1,0 +1,37 @@
+# LAMMPS data file for SPC/E water system (atom_style full)
+6 atoms
+2 atom types
+4 bonds
+1 bond types
+2 angles
+1 angle types
+
+0.000 20.000 xlo xhi
+0.000 20.000 ylo yhi
+0.000 20.000 zlo zhi
+
+Masses
+
+1 15.9994 # Oxygen
+2 1.0080  # Hydrogen
+
+Atoms # full
+
+1 1 1 -0.8476 10.000 10.000 10.000
+2 1 2  0.4238  9.444  9.243 10.000
+3 1 2  0.4238 10.814  9.487 10.000
+4 2 1 -0.8476 13.000 12.000 11.000
+5 2 2  0.4238 12.444 11.243 11.000
+6 2 2  0.4238 13.814 11.487 11.000
+
+Bonds
+
+1 1 1 2
+2 1 1 3
+3 1 4 5
+4 1 4 6
+
+Angles
+
+1 1 2 1 3
+2 1 5 4 6
