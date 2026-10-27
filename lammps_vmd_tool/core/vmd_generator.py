@@ -1,41 +1,46 @@
 """
-VMD Tcl script generator for LAMMPS data visualization.
-Generates publication-quality Tcl visualization scripts with topotools and pbctools.
+VMD Tcl script generator.
+
+Builds a self-contained Tcl script that is executed by VMD (through ``vmd -e``)
+and applies the selected element radii, exact RGB colors, unit cell and display
+settings. Data files are loaded through TopoTools, dump trajectories through
+VMD's native ``lammpstrj`` reader.
 """
 
-from dataclasses import dataclass
-import os
-from typing import Dict, Optional
+from __future__ import annotations
 
-from .parser import LammpsDataInfo, AtomTypeData
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from .parser import AtomTypeData, LammpsDataInfo
+
+
+TYPE_COLOR_BASE = 33
+TYPE_COLOR_SLOTS = 900
+BACKGROUND_COLOR_ID = 1000
+BOX_COLOR_ID = 1001
 
 
 @dataclass
 class VisualSettings:
-    preset_name: str = "ball_and_stick"
-    # Representation: "CPK", "VDW", "Licorice", "DynamicBonds", "Lines"
-    rep_style: str = "CPK"
+    preset_name: str = "publication"
+    rep_style: str = "CPK"  # CPK, VDW, Licorice, DynamicBonds, Lines
     sphere_scale: float = 0.35
     bond_radius: float = 0.18
-    color_by: str = "Element"  # "Element", "Type", "Charge", "Index"
-    material: str = "AOChalky"  # "AOChalky", "Diffuse", "Glossy", "Opaque", "Goodsell"
-    # Environment
-    bg_color: str = "white"     # "white", "black"
-    projection: str = "Orthographic"  # "Orthographic", "Perspective"
-    show_axes: bool = True
-    axes_location: str = "lowerleft"  # "lowerleft", "off"
+    material: str = "Opaque"
+    bg_color: str = "#FFFFFF"
+    projection: str = "Orthographic"
+    show_axes: bool = False
     depthcue: bool = False
-    # Box
     show_box: bool = True
-    box_color: str = "black"
+    box_color: str = "#1A1A1A"
     box_width: float = 1.5
-    # Auto-bonds
-    auto_bonds: bool = False
+    auto_bonds: bool = True
     bond_cutoff: float = 1.6
 
 
 class VmdScriptGenerator:
-    """Generates VMD startup / visualization Tcl scripts."""
+    """Generates the VMD startup script."""
 
     PRESETS = {
         "publication": VisualSettings(
@@ -43,195 +48,340 @@ class VmdScriptGenerator:
             rep_style="CPK",
             sphere_scale=0.35,
             bond_radius=0.18,
-            color_by="Type",  # Match explicit type colors
-            material="Opaque",  # Vibrant, clear solid color
-            bg_color="white",
+            material="Opaque",
+            bg_color="#FFFFFF",
             projection="Orthographic",
             show_axes=False,
-            axes_location="off",
             depthcue=False,
             show_box=True,
-            box_color="black",
-            box_width=2.0
+            box_color="#1A1A1A",
+            box_width=1.5,
         ),
-        "ball_and_stick": VisualSettings(
-            preset_name="ball_and_stick",
+        "dark": VisualSettings(
+            preset_name="dark",
             rep_style="CPK",
             sphere_scale=0.32,
             bond_radius=0.16,
-            color_by="Type",
             material="Glossy",
-            bg_color="black",
+            bg_color="#000000",
             projection="Perspective",
             show_axes=True,
-            axes_location="lowerleft",
             depthcue=True,
             show_box=True,
-            box_color="cyan",
-            box_width=1.5
+            box_color="#00C8C8",
+            box_width=1.5,
         ),
-        "vdw_spacefill": VisualSettings(
-            preset_name="vdw_spacefill",
+        "spacefill": VisualSettings(
+            preset_name="spacefill",
             rep_style="VDW",
             sphere_scale=1.0,
             bond_radius=0.1,
-            color_by="Type",
             material="Opaque",
-            bg_color="white",
+            bg_color="#FFFFFF",
             projection="Orthographic",
             show_axes=False,
-            axes_location="off",
             depthcue=False,
             show_box=True,
-            box_color="gray",
-            box_width=1.5
+            box_color="#808080",
+            box_width=1.5,
         ),
-        "licorice": VisualSettings(
-            preset_name="licorice",
+        "skeleton": VisualSettings(
+            preset_name="skeleton",
             rep_style="Licorice",
             sphere_scale=0.25,
-            bond_radius=0.25,
-            color_by="Type",
+            bond_radius=0.22,
             material="Opaque",
-            bg_color="black",
+            bg_color="#000000",
             projection="Perspective",
             show_axes=True,
-            axes_location="lowerleft",
             depthcue=True,
             show_box=True,
-            box_color="yellow",
-            box_width=1.5
-        )
+            box_color="#EDC948",
+            box_width=1.5,
+        ),
     }
 
     @classmethod
-    def generate(cls,
-                 info: LammpsDataInfo,
-                 atom_types: Optional[Dict[int, AtomTypeData]] = None,
-                 settings: Optional[VisualSettings] = None,
-                 custom_atom_style: Optional[str] = None) -> str:
-        """
-        Generates full VMD Tcl script text.
-        """
+    def generate(
+        cls,
+        info: LammpsDataInfo,
+        atom_types: Optional[Dict[int, AtomTypeData]] = None,
+        settings: Optional[VisualSettings] = None,
+    ) -> str:
         if settings is None:
             settings = cls.PRESETS["publication"]
         if atom_types is None:
             atom_types = info.atom_types
 
-        style = custom_atom_style if custom_atom_style else info.atom_style
+        types = sorted(atom_types.values(), key=lambda item: item.type_id)
+        lines: List[str] = []
 
-        # Normalize filepath to forward slashes for Tcl compatibility on Windows
-        clean_path = info.filepath.replace("\\", "/")
+        lines.append("# ============================================================")
+        lines.append("#  LAMMPS -> VMD")
+        lines.append(f"#  file type : {info.file_type}")
+        lines.append(f"#  atoms     : {info.num_atoms}")
+        lines.append(f"#  bonds     : {info.num_bonds}")
+        lines.append(f"#  atom types: {len(types)}")
+        lines.append("# ============================================================")
+        lines.append("")
 
-        tcl = []
-        tcl.append("# ==========================================================")
-        tcl.append(f"# VMD Visualization Script generated for LAMMPS Data File")
-        tcl.append(f"# Source File: {info.filepath}")
-        tcl.append(f"# Atoms: {info.num_atoms}, Bonds: {info.num_bonds}, Style: {style}")
-        tcl.append("# ==========================================================\n")
+        lines.append("set lvPath " + cls._tcl_string(info.filepath))
+        lines.append("")
 
-        tcl.append("# Require necessary VMD packages")
-        tcl.append("package require topotools 1.7")
-        tcl.append("package require pbctools 2.8\n")
+        # ---------------------------------------------------------- helpers
+        lines.append("proc ::lv__set_radii {molid pairs} {")
+        lines.append("    foreach {tid radius} $pairs {")
+        lines.append('        set sel [atomselect $molid "type $tid"]')
+        lines.append("        if {[$sel num] > 0} { $sel set radius $radius }")
+        lines.append("        $sel delete")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        lines.append("proc ::lv__frame_radii {molid pairs args} {")
+        lines.append("    catch { ::lv__set_radii $molid $pairs }")
+        lines.append("}")
+        lines.append("")
 
-        tcl.append("# Load LAMMPS data file using topotools")
-        tcl.append(f'puts "Loading LAMMPS data ({style} style)..."')
-        tcl.append(f'set molid [topo readlammpsdata "{clean_path}" {style}]\n')
+        if info.is_trajectory:
+            lines.append("# Load a LAMMPS text dump (native lammpstrj molfile reader)")
+            lines.append("catch { package require pbctools }")
+            lines.append("set lvMolid [mol new $lvPath type lammpstrj waitfor all]")
+            lines.append('if {$lvMolid < 0} { error "VMD could not read the LAMMPS trajectory file" }')
+        else:
+            lines.append("# Load a LAMMPS data file through TopoTools")
+            lines.append("if {[catch { package require topotools } lvPkgErr]} {")
+            lines.append('    error "TopoTools is required to read data files: $lvPkgErr"')
+            lines.append("}")
+            lines.append("catch { package require pbctools }")
+            lines.append("")
+            lines.append("proc ::lv__load_data {path styles} {")
+            lines.append("    foreach style $styles {")
+            lines.append("        if {![catch {topo readlammpsdata $path $style} m]} {")
+            lines.append("            if {[molinfo $m get numatoms] > 0} { return $m }")
+            lines.append("            catch { mol delete $m }")
+            lines.append("        }")
+            lines.append("    }")
+            lines.append('    error "TopoTools could not read the data file (styles: $styles)"')
+            lines.append("}")
+            lines.append("")
+            styles = " ".join(info.style_candidates())
+            lines.append(f"set lvMolid [::lv__load_data $lvPath {{{styles}}}]")
 
-        # Periodic unit cell configuration
+        lines.append("mol top $lvMolid")
+        lines.append("")
+
+        # ---------------------------------------------------------- unit cell
         if info.box:
             a, b, c, alpha, beta, gamma = info.box.to_vmd_unitcell()
-            tcl.append("# Simulation Box & Unit Cell setup")
-            tcl.append(f"molinfo $molid set a {a:.4f}")
-            tcl.append(f"molinfo $molid set b {b:.4f}")
-            tcl.append(f"molinfo $molid set c {c:.4f}")
-            tcl.append(f"molinfo $molid set alpha {alpha:.4f}")
-            tcl.append(f"molinfo $molid set beta {beta:.4f}")
-            tcl.append(f"molinfo $molid set gamma {gamma:.4f}\n")
+            lines.append("# Simulation cell")
+            lines.append("if {[catch {")
+            lines.append(f"    molinfo $lvMolid set a {a:.4f}")
+            lines.append(f"    molinfo $lvMolid set b {b:.4f}")
+            lines.append(f"    molinfo $lvMolid set c {c:.4f}")
+            lines.append(f"    molinfo $lvMolid set alpha {alpha:.4f}")
+            lines.append(f"    molinfo $lvMolid set beta {beta:.4f}")
+            lines.append(f"    molinfo $lvMolid set gamma {gamma:.4f}")
+            lines.append("} lvErr]} { puts \"Cell setup skipped: $lvErr\" }")
+            lines.append("")
 
-        # Element, name, radius, and color assignment per atom type
-        tcl.append("# Assign chemical elements, names, radii, and vibrant colors")
-        for tid, tdata in sorted(atom_types.items()):
-            elem = tdata.element.strip()
-            rad = tdata.radius
-            vmd_col = tdata.color
-            tcl.append(f'catch {{ color Type {tid} "{vmd_col}" }}')
-            tcl.append(f'catch {{ color Element "{elem}" "{vmd_col}" }}')
-            tcl.append(f'catch {{ color Name "{elem}" "{vmd_col}" }}')
-            tcl.append(f'set sel [atomselect $molid "type {tid}"]')
-            tcl.append(f'if {{[$sel num] > 0}} {{')
-            tcl.append(f'    $sel set element "{elem}"')
-            tcl.append(f'    $sel set name "{elem}"')
-            tcl.append(f'    $sel set radius {rad:.3f}')
-            tcl.append(f'}}')
-            tcl.append(f'$sel delete\n')
+        # ------------------------------------------------- types, colors, radii
+        lines.append("# Per-type colors (exact RGB), elements and radii")
+        for index, atom_type in enumerate(types):
+            color_id = TYPE_COLOR_BASE + (index % TYPE_COLOR_SLOTS)
+            red, green, blue = cls._hex_to_rgb(atom_type.color)
+            lines.append(f"color change rgb {color_id} {red:.4f} {green:.4f} {blue:.4f}")
+            lines.append(f"color Type {atom_type.type_id} {color_id}")
+        lines.append("")
 
-        # Auto-detect bonds if no bonds in data file and requested
-        if info.num_bonds == 0 and settings.auto_bonds:
-            tcl.append("# Recalculate dynamic bonds")
-            tcl.append(f'mol bondsrecalc $molid\n')
+        for atom_type in types:
+            element = atom_type.element.strip()
+            lines.append(f'set sel [atomselect $lvMolid "type {atom_type.type_id}"]')
+            lines.append("if {[$sel num] > 0} {")
+            lines.append(f"    $sel set radius {atom_type.radius:.3f}")
+            if element and element != "X":
+                lines.append(f'    $sel set name "{element}"')
+                lines.append(f'    $sel set element "{element}"')
+            lines.append("}")
+            lines.append("$sel delete")
+        lines.append("")
 
-        # Visual Environment & Lighting (Prevents washed-out/grayish display in VMD 2.0)
-        tcl.append("# Display & Lighting Environment")
-        tcl.append(f"color Display Background {settings.bg_color}")
-        tcl.append(f"display projection {settings.projection}")
-        tcl.append(f"display depthcue {'on' if settings.depthcue else 'off'}")
-        tcl.append(f"axes location {settings.axes_location}")
-        tcl.append("display rendermode GLSL")
-        tcl.append("catch { material change ambient Opaque 0.15 }")
-        tcl.append("catch { material change diffuse Opaque 0.80 }")
-        tcl.append("catch { material change specular Opaque 0.35 }")
-        tcl.append("catch { material change shininess Opaque 0.35 }")
-        tcl.append("display update ui\n")
+        if types:
+            pairs = " ".join(f"{item.type_id} {item.radius:.3f}" for item in types)
+            lines.append(f"set lvRadii {{{pairs}}}")
+            lines.append("::lv__set_radii $lvMolid $lvRadii")
+            lines.append("if {[molinfo $lvMolid get numframes] > 1} {")
+            lines.append(
+                "    catch { trace add variable ::vmd_frame($lvMolid) write "
+                "[list ::lv__frame_radii $lvMolid $lvRadii] }"
+            )
+            lines.append("}")
+            lines.append("")
 
-        # Representations
-        tcl.append("# Representations")
-        tcl.append("mol delrep 0 $molid")
+        # ---------------------------------------------------------- display env
+        bg_red, bg_green, bg_blue = cls._hex_to_rgb(settings.bg_color)
+        lines.append("# Display environment")
+        lines.append(
+            f"color change rgb {BACKGROUND_COLOR_ID} {bg_red:.4f} {bg_green:.4f} {bg_blue:.4f}"
+        )
+        lines.append(f"color Display Background {BACKGROUND_COLOR_ID}")
+        lines.append(f"display projection {settings.projection}")
+        lines.append(f"display depthcue {'on' if settings.depthcue else 'off'}")
+        lines.append(f"axes location {'lowerleft' if settings.show_axes else 'off'}")
+        lines.append("catch { display rendermode GLSL }")
+        lines.append("catch { material change ambient Opaque 0.15 }")
+        lines.append("catch { material change diffuse Opaque 0.80 }")
+        lines.append("catch { material change specular Opaque 0.35 }")
+        lines.append("catch { material change shininess Opaque 0.35 }")
+        lines.append("catch { material change ambient Glossy 0.16 }")
+        lines.append("catch { material change diffuse Glossy 0.82 }")
+        lines.append("catch { material change specular Glossy 0.24 }")
+        lines.append("catch { material change shininess Glossy 0.35 }")
+        lines.append("")
 
-        rep_style = settings.rep_style.upper()
-        if rep_style == "CPK":
-            rep_cmd = f"CPK {settings.sphere_scale:.2f} {settings.bond_radius:.2f} 32 32"
-        elif rep_style == "VDW":
-            rep_cmd = f"VDW {settings.sphere_scale:.2f} 32"
-        elif rep_style == "LICORICE":
-            rep_cmd = f"Licorice {settings.bond_radius:.2f} 20 20"
-        elif rep_style == "DYNAMICBONDS":
-            rep_cmd = f"DynamicBonds {settings.bond_cutoff:.2f} {settings.bond_radius:.2f} 20"
-        elif rep_style == "LINES":
-            rep_cmd = f"Lines {int(settings.bond_radius * 10)}"
-        else:
-            rep_cmd = f"CPK {settings.sphere_scale:.2f} {settings.bond_radius:.2f} 32 32"
+        # ---------------------------------------------------------- representation
+        rep_args = cls._representation_args(settings)
+        lines.append("# Representation")
+        lines.append("if {[molinfo $lvMolid get numreps] < 1} { mol addrep $lvMolid }")
+        lines.append("if {[catch {")
+        lines.append(f"    mol modstyle 0 $lvMolid {rep_args}")
+        lines.append("    mol modcolor 0 $lvMolid Type")
+        lines.append(f"    mol modmaterial 0 $lvMolid {settings.material}")
+        lines.append('    mol modselect 0 $lvMolid "all"')
+        lines.append("} lvErr]} {")
+        lines.append('    puts "Representation fallback: $lvErr"')
+        lines.append("    catch { mol modstyle 0 $lvMolid CPK 0.35 0.18 24 20 }")
+        lines.append("}")
+        lines.append("")
 
-        tcl.append(f'mol representation {rep_cmd}')
-        tcl.append(f'mol color {settings.color_by}')
-        tcl.append(f'mol selection "all"')
-        tcl.append(f'mol material {settings.material}')
-        tcl.append(f'mol addrep $molid\n')
+        auto_bonds = (
+            settings.auto_bonds
+            and info.num_bonds == 0
+            and settings.rep_style.upper() in ("CPK", "LICORICE", "LINES")
+        )
+        if auto_bonds:
+            lines.append("# Distance-based bonds for topologies without bonds")
+            lines.append("mol addrep $lvMolid")
+            lines.append("set lvRep [expr {[molinfo $lvMolid get numreps] - 1}]")
+            lines.append(
+                f"catch {{ mol modstyle $lvRep $lvMolid DynamicBonds "
+                f"{settings.bond_cutoff:.2f} {settings.bond_radius:.2f} 20 }}"
+            )
+            lines.append("catch { mol modcolor $lvRep $lvMolid Type }")
+            lines.append("catch { mol modmaterial $lvRep $lvMolid Opaque }")
+            lines.append('catch { mol modselect $lvRep $lvMolid "all" }')
+            lines.append("")
 
-        # If bonds were absent and DynamicBonds wasn't the main representation, add bonds if requested
-        if info.num_bonds == 0 and not settings.auto_bonds and rep_style == "CPK":
-            tcl.append("# Optional: Add dynamic bonds representation for bondless atomic systems")
-            tcl.append(f'mol representation DynamicBonds {settings.bond_cutoff:.2f} {settings.bond_radius:.2f} 20')
-            tcl.append(f'mol color {settings.color_by}')
-            tcl.append(f'mol selection "all"')
-            tcl.append(f'mol material {settings.material}')
-            tcl.append(f'mol addrep $molid\n')
-
-        # PBC Box Drawing
+        # ---------------------------------------------------------- box and camera
         if settings.show_box and info.box:
-            tcl.append("# Render Simulation Box boundary")
-            tcl.append(f'pbc box -molid $molid -color {settings.box_color} -width {settings.box_width:.1f}\n')
+            red, green, blue = cls._hex_to_rgb(settings.box_color)
+            lines.append("# Simulation box")
+            lines.append(
+                f"color change rgb {BOX_COLOR_ID} {red:.4f} {green:.4f} {blue:.4f}"
+            )
+            lines.append(
+                f"if {{[catch {{ pbc box -molid $lvMolid -color {BOX_COLOR_ID} "
+                f"-width {settings.box_width:.2f} }} lvErr]}} {{"
+            )
+            lines.append('    catch { pbc box -molid $lvMolid -color black -width 1.5 }')
+            lines.append("}")
+            lines.append("")
 
-        # Camera & Centering
-        tcl.append("# Center and adjust view")
-        tcl.append("mol center $molid")
-        tcl.append("display resetview")
-        tcl.append("# Open VMD Tk Console automatically so user can interact")
-        tcl.append("catch { menu tkcon on }")
-        tcl.append('puts "=========================================================="')
-        tcl.append('puts " [LAMMPS Visualizer] Data file loaded into VMD successfully!"')
-        tcl.append(f'puts " File: {clean_path}"')
-        tcl.append(f'puts " Atoms: {info.num_atoms} | Bonds: {info.num_bonds} | Style: {style}"')
-        tcl.append('puts "=========================================================="')
+        lines.append("# Center and fit the view")
+        lines.append("mol center $lvMolid")
+        lines.append("display resetview")
+        if info.box:
+            box_span = max(info.box.to_vmd_unitcell()[:3])
+            lines.append("set lvSel [atomselect $lvMolid all]")
+            lines.append("set lvMinmax [measure minmax $lvSel]")
+            lines.append("$lvSel delete")
+            lines.append("set lvSpan 0.0")
+            lines.append("foreach lvI {0 1 2} {")
+            lines.append(
+                "    set lvD [expr {abs([lindex $lvMinmax 1 $lvI] - "
+                "[lindex $lvMinmax 0 $lvI])}]"
+            )
+            lines.append("    if {$lvD > $lvSpan} { set lvSpan $lvD }")
+            lines.append("}")
+            lines.append(f"set lvBoxSpan {box_span:.4f}")
+            lines.append("if {$lvSpan > 0.0 && $lvBoxSpan > $lvSpan} {")
+            lines.append("    catch { scale by [expr {0.92 * $lvSpan / $lvBoxSpan}] }")
+            lines.append("}")
+        lines.append("display update ui")
+        lines.append("")
 
-        return "\n".join(tcl) + "\n"
+        # ---------------------------------------------------------- console
+        lines.append('puts "=========================================================="')
+        lines.append('puts " LAMMPS -> VMD : loaded molecule $lvMolid"')
+        lines.append('puts " File   : $lvPath"')
+        lines.append('puts " Atoms  : [molinfo $lvMolid get numatoms]"')
+        lines.append('puts " Frames : [molinfo $lvMolid get numframes]"')
+        lines.append('puts "=========================================================="')
+        lines.append("")
+        lines.append("# Open the VMD Tk Console so the scene can be refined interactively")
+        lines.append("after idle { after 2 { catch { menu tkcon on } } }")
+
+        return "\n".join(lines) + "\n"
+
+    # ------------------------------------------------------------------
+    # Formatting helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _hex_to_rgb(color: str) -> Tuple[float, float, float]:
+        value = (color or "").strip().lstrip("#")
+        if len(value) == 3:
+            value = "".join(char * 2 for char in value)
+        if len(value) != 6:
+            return (0.8, 0.8, 0.8)
+        try:
+            return (
+                int(value[0:2], 16) / 255.0,
+                int(value[2:4], 16) / 255.0,
+                int(value[4:6], 16) / 255.0,
+            )
+        except ValueError:
+            return (0.8, 0.8, 0.8)
+
+    @staticmethod
+    def _tcl_string(text: str) -> str:
+        """Builds an ASCII-only double-quoted Tcl string from an arbitrary path."""
+        text = text.replace("\\", "/")
+        out: List[str] = ['"']
+        for char in text:
+            code = ord(char)
+            if char == '"':
+                out.append('\\"')
+            elif char == "$":
+                out.append("\\$")
+            elif char == "[":
+                out.append("\\[")
+            elif char == "]":
+                out.append("\\]")
+            elif char == "\n":
+                out.append("\\n")
+            elif code < 0x20 or code > 0x7E:
+                if code <= 0xFFFF:
+                    out.append(f"\\u{code:04x}")
+                else:
+                    out.append(f"\\U{code:08x}")
+            else:
+                out.append(char)
+        out.append('"')
+        return "".join(out)
+
+    @staticmethod
+    def _representation_args(settings: VisualSettings) -> str:
+        style = settings.rep_style.upper()
+        if style == "CPK":
+            return f"CPK {settings.sphere_scale:.2f} {settings.bond_radius:.2f} 32 32"
+        if style == "VDW":
+            return f"VDW {settings.sphere_scale:.2f} 32"
+        if style == "LICORICE":
+            return f"Licorice {settings.bond_radius:.2f} 20 20"
+        if style == "DYNAMICBONDS":
+            return (
+                f"DynamicBonds {settings.bond_cutoff:.2f} "
+                f"{settings.bond_radius:.2f} 20"
+            )
+        if style == "LINES":
+            return f"Lines {max(1.0, settings.bond_radius * 10):.1f}"
+        return f"CPK {settings.sphere_scale:.2f} {settings.bond_radius:.2f} 32 32"

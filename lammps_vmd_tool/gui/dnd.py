@@ -1,91 +1,106 @@
 """
-Drag and drop support for Tkinter on Windows.
-Wraps windnd or ctypes WM_DROPFILES to enable dropping files from File Explorer.
+Native Windows drag & drop support for Tkinter windows.
+
+Uses WM_DROPFILES through ctypes, so no third-party package is required and
+the frozen one-file executable behaves exactly like the Python version.
 """
 
+from __future__ import annotations
+
+import ctypes
 import os
 import sys
+from ctypes import wintypes
 from typing import Callable, List
 
+WM_DROPFILES = 0x0233
+GWLP_WNDPROC = -4
 
-def hook_drop_files(widget, on_drop_callback: Callable[[List[str]], None]):
-    """
-    Hooks a Tkinter widget or window to accept dropped files from Windows Explorer.
-    Calls on_drop_callback with a list of absolute file paths (str).
-    """
+
+def _window_handle(widget) -> int:
+    widget.update_idletasks()
+    frame = widget.wm_frame()
+    try:
+        return int(frame, 16)
+    except (TypeError, ValueError):
+        return int(frame)
+
+
+def hook_drop_files(widget, on_drop: Callable[[List[str]], None]) -> bool:
+    """Registers a Tk toplevel window to receive files dropped from Explorer."""
     if not sys.platform.startswith("win"):
         return False
 
-    # 1. Try windnd first
     try:
-        import windnd
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
 
-        def _windnd_handler(files):
-            file_paths = []
-            for f in files:
-                if isinstance(f, bytes):
-                    try:
-                        decoded = f.decode("utf-8")
-                    except UnicodeDecodeError:
-                        decoded = f.decode("gbk", errors="replace")
-                else:
-                    decoded = str(f)
-                if os.path.exists(decoded):
-                    file_paths.append(os.path.abspath(decoded))
-            if file_paths:
-                on_drop_callback(file_paths)
+        is_64bit = ctypes.sizeof(ctypes.c_void_p) == 8
+        long_ptr = ctypes.c_ssize_t if is_64bit else ctypes.c_long
+        get_long = user32.GetWindowLongPtrW if is_64bit else user32.GetWindowLongW
+        set_long = user32.SetWindowLongPtrW if is_64bit else user32.SetWindowLongW
 
-        windnd.hook_dropfiles(widget, func=_windnd_handler, force_unicode=True)
-        return True
-    except Exception as e:
-        pass
+        get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        get_long.restype = long_ptr
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, long_ptr]
+        set_long.restype = long_ptr
 
-    # 2. Fallback to direct ctypes implementation
-    try:
-        import ctypes
-        from ctypes.wintypes import DWORD
+        user32.CallWindowProcW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.CallWindowProcW.restype = ctypes.c_ssize_t
 
-        hwnd = widget.winfo_id()
-        if hasattr(widget, "wm_frame"):
-            try:
-                # Top level frame
-                hwnd = int(widget.wm_frame(), 16)
-            except Exception:
-                hwnd = widget.winfo_id()
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.UINT,
+            wintypes.LPWSTR,
+            wintypes.UINT,
+        ]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragFinish.argtypes = [wintypes.HANDLE]
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
 
-        import platform
-        is_64bit = platform.architecture()[0] == "64bit"
-        argtype = ctypes.c_uint64 if is_64bit else DWORD
-        GetWindowLong = ctypes.windll.user32.GetWindowLongPtrA if is_64bit else ctypes.windll.user32.GetWindowLongW
-        SetWindowLong = ctypes.windll.user32.SetWindowLongPtrA if is_64bit else ctypes.windll.user32.SetWindowLongW
-        prototype = ctypes.WINFUNCTYPE(argtype, argtype, argtype, argtype, argtype)
+        proc_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
 
-        WM_DROPFILES = 0x0233
-        GWL_WNDPROC = -4
+        hwnd = _window_handle(widget)
+        old_proc = get_long(hwnd, GWLP_WNDPROC)
 
-        def py_drop_proc(h_wnd, msg, w_param, l_param):
-            if msg == WM_DROPFILES:
-                count = ctypes.windll.shell32.DragQueryFileW(argtype(w_param), -1, None, 0)
-                file_paths = []
-                buffer = ctypes.create_unicode_buffer(512)
-                for i in range(count):
-                    ctypes.windll.shell32.DragQueryFileW(argtype(w_param), i, buffer, 512)
-                    path = buffer.value
-                    if os.path.exists(path):
-                        file_paths.append(os.path.abspath(path))
-                ctypes.windll.shell32.DragFinish(argtype(w_param))
-                if file_paths:
-                    widget.after(10, lambda: on_drop_callback(file_paths))
-            return ctypes.windll.user32.CallWindowProcW(old_proc, h_wnd, msg, w_param, l_param)
+        def handler(hwnd_value, message, wparam, lparam):
+            if message == WM_DROPFILES:
+                try:
+                    drop_handle = wintypes.HANDLE(wparam)
+                    count = shell32.DragQueryFileW(drop_handle, 0xFFFFFFFF, None, 0)
+                    paths: List[str] = []
+                    for index in range(count):
+                        length = shell32.DragQueryFileW(drop_handle, index, None, 0)
+                        buffer = ctypes.create_unicode_buffer(length + 1)
+                        shell32.DragQueryFileW(drop_handle, index, buffer, length + 1)
+                        if os.path.isfile(buffer.value):
+                            paths.append(os.path.abspath(buffer.value))
+                    shell32.DragFinish(drop_handle)
+                    if paths:
+                        widget.after(10, lambda: on_drop(paths))
+                except Exception:
+                    pass
+            return user32.CallWindowProcW(
+                ctypes.c_void_p(old_proc), hwnd_value, message, wparam, lparam
+            )
 
-        old_proc = GetWindowLong(hwnd, GWL_WNDPROC)
-        new_proc = prototype(py_drop_proc)
-        # Keep reference to prevent garbage collection
-        widget._dnd_new_proc = new_proc
-
-        ctypes.windll.shell32.DragAcceptFiles(hwnd, True)
-        SetWindowLong(hwnd, GWL_WNDPROC, new_proc)
+        new_proc = proc_type(handler)
+        widget._drop_handler = new_proc
+        widget._drop_old_proc = old_proc
+        set_long(hwnd, GWLP_WNDPROC, ctypes.cast(new_proc, ctypes.c_void_p).value)
+        shell32.DragAcceptFiles(hwnd, True)
         return True
     except Exception:
         return False
-

@@ -1,665 +1,982 @@
-"""
-Modern, streamlined Tkinter GUI for LAMMPS Data to VMD Visualization.
-Features:
-- Sleek modern card-based interface with high-contrast visual styling
-- Drag & drop support across the entire window
-- Auto-launch VMD option on file drop
-- Robust element auto-detection and vibrant color mapping
-- Publication-quality presets (Opaque/Glossy, no washed-out chalky white)
-- 1-Click VMD launcher and .vmd script export
-"""
+"""Win11-style Tkinter front-end for the LAMMPS -> VMD viewer."""
 
+from __future__ import annotations
+
+import ctypes
 import os
 import sys
 import tempfile
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox, ttk
+from typing import Dict, List, Optional
 
-from ..core.parser import LammpsDataParser, LammpsDataInfo, AtomTypeData
-from ..core.periodic_table import ELEMENTS_DB, get_element_info, guess_element_from_mass
-from ..core.vmd_generator import VmdScriptGenerator, VisualSettings
 from ..core.launcher import find_vmd_executable, launch_vmd, save_config
+from ..core.parser import (
+    AtomTypeData,
+    InvalidEncodingError,
+    LammpsDataInfo,
+    LammpsDataParser,
+    LammpsFileError,
+)
+from ..core.vmd_generator import VisualSettings, VmdScriptGenerator
+from . import theme
 from .dnd import hook_drop_files
+from .theme import (
+    ColorChip,
+    ColorField,
+    DropZone,
+    FONTS,
+    ModernSlider,
+    ScrollList,
+    SegmentedControl,
+    Theme,
+    ToggleSwitch,
+    make_card,
+    normalize_hex,
+)
 
 
-class ModernTheme:
-    BG_MAIN = "#F8FAFC"       # Slate 50
-    CARD_BG = "#FFFFFF"       # Pure white card
-    BORDER = "#E2E8F0"        # Subtle border
-    PRIMARY = "#2563EB"       # Modern Royal Blue
-    PRIMARY_HOVER = "#1D4ED8"
-    TEXT_MAIN = "#0F172A"     # Slate 900
-    TEXT_MUTED = "#64748B"    # Slate 500
-    ACCENT_DROP = "#EFF6FF"   # Light blue tint for drop zone
-    BORDER_DROP = "#BFDBFE"
-    PILL_BG = "#F1F5F9"       # Slate 100
+REP_OPTIONS = [
+    ("CPK 球棍", "CPK"),
+    ("VDW 空间填充", "VDW"),
+    ("Licorice 棍状", "Licorice"),
+    ("DynamicBonds 动态键", "DynamicBonds"),
+    ("Lines 线框", "Lines"),
+]
+
+PRESET_OPTIONS = [
+    ("publication", "期刊"),
+    ("dark", "深色"),
+    ("spacefill", "填充"),
+    ("skeleton", "骨架"),
+]
+
+PROJECTION_OPTIONS = [
+    ("Orthographic", "正交"),
+    ("Perspective", "透视"),
+]
 
 
-class LammpsVmdApp(tk.Tk):
-    def __init__(self, initial_file: str = "", auto_launch: bool = False):
-        super().__init__()
-        self.title("LAMMPS Data -> VMD Visualizer")
-        self.geometry("1000x800")
-        self.minsize(880, 660)
-        self.configure(bg=ModernTheme.BG_MAIN)
-
-        # Apply modern styling
-        self._setup_styles()
-
-        # Data states
-        self.current_info: LammpsDataInfo = None
-        self.atom_types_data: dict[int, AtomTypeData] = {}
-        self.vmd_exe_path: str = find_vmd_executable() or ""
-
-        # UI Variables
-        self.file_path_var = tk.StringVar(value=initial_file)
-        self.auto_launch_on_drop_var = tk.BooleanVar(value=True)
-        self.style_var = tk.StringVar(value="full")
-        self.preset_var = tk.StringVar(value="publication")
-        self.rep_style_var = tk.StringVar(value="CPK")
-        self.sphere_scale_var = tk.DoubleVar(value=0.35)
-        self.bond_radius_var = tk.DoubleVar(value=0.18)
-        self.color_by_var = tk.StringVar(value="Type")
-        self.material_var = tk.StringVar(value="Opaque")
-        self.bg_color_var = tk.StringVar(value="white")
-        self.projection_var = tk.StringVar(value="Orthographic")
-        self.show_axes_var = tk.BooleanVar(value=False)
-        self.show_box_var = tk.BooleanVar(value=True)
-        self.box_color_var = tk.StringVar(value="black")
-        self.box_width_var = tk.DoubleVar(value=2.0)
-        self.auto_bonds_var = tk.BooleanVar(value=False)
-        self.bond_cutoff_var = tk.DoubleVar(value=1.6)
-        self.status_var = tk.StringVar(value="Ready. Drag & drop a LAMMPS data file here to visualize.")
-
-        # Build UI layout
-        self._build_ui()
-
-        # Hook drag and drop
-        hook_drop_files(self, self._on_files_dropped)
-        hook_drop_files(self.drop_card, self._on_files_dropped)
-
-        if initial_file and os.path.isfile(initial_file):
-            self.load_file(initial_file)
-            if auto_launch:
-                self.after(200, self._on_launch_vmd)
-
-    def _setup_styles(self):
-        style = ttk.Style(self)
+def _enable_dpi_awareness() -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
         try:
-            style.theme_use("clam")
+            ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
 
-        # Notebook tabs
-        style.configure("TNotebook", background=ModernTheme.BG_MAIN, borderwidth=0)
-        style.configure(
-            "TNotebook.Tab",
-            background=ModernTheme.CARD_BG,
-            foreground=ModernTheme.TEXT_MAIN,
-            padding=(16, 8),
-            font=("Segoe UI", 9, "bold"),
-            borderwidth=1,
-            lightcolor=ModernTheme.BORDER,
-            darkcolor=ModernTheme.BORDER
+
+def _resource_path(relative: str) -> str:
+    base = getattr(sys, "_MEIPASS", None)
+    if base is None:
+        base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(base, relative)
+
+
+def _shorten(text: str, limit: int = 64) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit // 2 - 2] + "…" + text[-(limit // 2 - 1):]
+
+
+class LammpsVmdApp(tk.Tk):
+    def __init__(self, initial_file: str = ""):
+        super().__init__()
+        self.title("LAMMPS → VMD")
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        width = min(1100, max(900, screen_width - 80))
+        height = min(800, max(650, screen_height - 110))
+        self.geometry(
+            f"{width}x{height}+{(screen_width - width) // 2}+"
+            f"{max(0, (screen_height - height) // 2 - 20)}"
         )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", ModernTheme.PRIMARY), ("active", "#DBEAFE")],
-            foreground=[("selected", "#FFFFFF"), ("active", ModernTheme.PRIMARY)]
-        )
+        self.minsize(940, 650)
+        self.configure(bg=Theme.BG)
+        try:
+            self.tk.call("tk", "scaling", self.winfo_fpixels("1i") / 72.0)
+        except Exception:
+            pass
 
-        # Primary Action Button
-        style.configure(
-            "Primary.TButton",
-            font=("Segoe UI", 10, "bold"),
-            background=ModernTheme.PRIMARY,
-            foreground="#FFFFFF",
-            padding=(18, 8),
-            borderwidth=0
-        )
-        style.map("Primary.TButton", background=[("active", ModernTheme.PRIMARY_HOVER)])
+        theme.apply_theme(self)
+        self._set_window_icon()
 
-        # Standard clean button
-        style.configure("TButton", font=("Segoe UI", 9), padding=(10, 5))
-        style.configure("TLabel", background=ModernTheme.CARD_BG, font=("Segoe UI", 9))
-        style.configure("TLabelframe", background=ModernTheme.CARD_BG, relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=ModernTheme.CARD_BG, font=("Segoe UI", 9, "bold"), foreground=ModernTheme.TEXT_MAIN)
+        self.info: Optional[LammpsDataInfo] = None
+        self.atom_types: Dict[int, AtomTypeData] = {}
+        self.current_path = ""
+        self.vmd_exe = find_vmd_executable() or ""
+        self._file_card_visible = False
 
-    def _build_ui(self):
-        # 1. Top Card: Drag & Drop Zone + File Selector
-        self.drop_card = tk.Frame(
-            self,
-            bg=ModernTheme.ACCENT_DROP,
-            bd=1,
-            relief="solid",
-            highlightbackground=ModernTheme.BORDER_DROP,
-            highlightthickness=1,
-            cursor="hand2"
-        )
-        self.drop_card.pack(fill="x", padx=14, pady=(12, 6))
+        # Visual state (kept in sync with the settings widgets)
+        self.preset_key: Optional[str] = "publication"
+        self.rep_style = "CPK"
+        self.sphere_scale = 0.35
+        self.bond_radius = 0.18
+        self.material = "Opaque"
+        self.bg_color = "#FFFFFF"
+        self.projection = "Orthographic"
+        self.show_axes = False
+        self.depthcue = False
+        self.show_box = True
+        self.box_color = "#1A1A1A"
+        self.auto_bonds = True
 
-        # Drop Banner Row
-        banner_row = tk.Frame(self.drop_card, bg=ModernTheme.ACCENT_DROP)
-        banner_row.pack(fill="x", padx=14, pady=(10, 4))
+        self._rep_label_to_key = {label: key for label, key in REP_OPTIONS}
+        self._rep_key_to_label = {key: label for label, key in REP_OPTIONS}
 
-        lbl_icon_title = tk.Label(
-            banner_row,
-            text="📥  拖拽 LAMMPS .data 文件至此处（或窗口任意位置）即刻在 VMD 中展示",
-            font=("Microsoft YaHei", 10, "bold"),
-            bg=ModernTheme.ACCENT_DROP,
-            fg=ModernTheme.PRIMARY
-        )
-        lbl_icon_title.pack(side="left")
+        self._build_ui()
+        self._apply_preset("publication")
+        self._update_vmd_status()
+        self._update_actions()
+        self._set_status("就绪 · 导入文件后可先调整设置，再点击“在 VMD 中显示”")
 
-        chk_auto = ttk.Checkbutton(
-            banner_row,
-            text="拖入后立即自动启动 VMD (Auto-Launch)",
-            variable=self.auto_launch_on_drop_var
-        )
-        chk_auto.pack(side="right")
+        hook_drop_files(self, self._on_files_dropped)
 
-        # File path & browse row
-        path_row = tk.Frame(self.drop_card, bg=ModernTheme.ACCENT_DROP)
-        path_row.pack(fill="x", padx=14, pady=(4, 10))
+        if initial_file and os.path.isfile(initial_file):
+            self.after(120, lambda: self._load_file(initial_file))
 
-        ent_file = ttk.Entry(path_row, textvariable=self.file_path_var, font=("Consolas", 10))
-        ent_file.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    # ------------------------------------------------------------------
+    # Window scaffolding
+    # ------------------------------------------------------------------
+    def _set_window_icon(self) -> None:
+        icon = _resource_path(os.path.join("assets", "app.ico"))
+        if os.path.isfile(icon):
+            try:
+                self.iconbitmap(icon)
+            except Exception:
+                pass
 
-        btn_browse = ttk.Button(path_row, text="浏览... (Browse)", command=self._on_browse_file)
-        btn_browse.pack(side="left", padx=3)
+    def _build_ui(self) -> None:
+        header = tk.Frame(self, bg=Theme.BG)
+        header.pack(fill="x", padx=26, pady=(18, 4))
 
-        btn_reload = ttk.Button(path_row, text="重新加载", command=self._on_reload_file)
-        btn_reload.pack(side="left", padx=3)
-
-        # 2. System Overview Stats Pills
-        self.stats_frame = tk.Frame(self, bg=ModernTheme.BG_MAIN)
-        self.stats_frame.pack(fill="x", padx=14, pady=(0, 6))
-
-        self.lbl_pills = tk.Label(
-            self.stats_frame,
-            text="💡 提示：请先选择或拖入 LAMMPS 数据文件（支持 .data / .lmp）",
-            font=("Segoe UI", 9),
-            bg=ModernTheme.BG_MAIN,
-            fg=ModernTheme.TEXT_MUTED
-        )
-        self.lbl_pills.pack(side="left", pady=2)
-
-        # Style dropdown on the right of stats
-        style_sub = tk.Frame(self.stats_frame, bg=ModernTheme.BG_MAIN)
-        style_sub.pack(side="right")
-        tk.Label(style_sub, text="Atom Style:", bg=ModernTheme.BG_MAIN, font=("Segoe UI", 9, "bold")).pack(side="left", padx=4)
-        self.combo_style = ttk.Combobox(
-            style_sub,
-            textvariable=self.style_var,
-            values=["full", "molecular", "atomic", "charge", "dipole", "metal"],
-            width=10,
-            state="readonly"
-        )
-        self.combo_style.pack(side="left")
-        self.combo_style.bind("<<ComboboxSelected>>", lambda e: self.update_script_preview())
-
-        # 3. Main Notebook Card
-        notebook_card = tk.Frame(self, bg=ModernTheme.CARD_BG, bd=1, relief="solid")
-        notebook_card.pack(fill="both", expand=True, padx=14, pady=4)
-
-        self.notebook = ttk.Notebook(notebook_card)
-        self.notebook.pack(fill="both", expand=True, padx=4, pady=4)
-
-        # Tab 1: Atom Types & Elements
-        tab_elements = tk.Frame(self.notebook, bg=ModernTheme.CARD_BG, padx=8, pady=8)
-        self.notebook.add(tab_elements, text=" 🧬 原子与元素映射 (Elements) ")
-        self._build_elements_tab(tab_elements)
-
-        # Tab 2: Visual Style & Box
-        tab_visual = tk.Frame(self.notebook, bg=ModernTheme.CARD_BG, padx=10, pady=8)
-        self.notebook.add(tab_visual, text=" 🎨 视觉预设与晶胞 (Display & Box) ")
-        self._build_visual_tab(tab_visual)
-
-        # Tab 3: Script Preview
-        tab_script = tk.Frame(self.notebook, bg=ModernTheme.CARD_BG, padx=8, pady=8)
-        self.notebook.add(tab_script, text=" 📜 VMD 脚本预览 (Tcl Script) ")
-        self._build_script_tab(tab_script)
-
-        # 4. Bottom Action Footer Bar
-        footer = tk.Frame(self, bg=ModernTheme.BG_MAIN, pady=6)
-        footer.pack(fill="x", side="bottom", padx=14)
-
-        # Left: VMD status badge
-        vmd_box = tk.Frame(footer, bg=ModernTheme.BG_MAIN)
-        vmd_box.pack(side="left")
-
-        self.lbl_vmd_badge = tk.Label(
-            vmd_box,
-            text=f"● VMD: {os.path.basename(self.vmd_exe_path)}" if self.vmd_exe_path else "○ VMD: 未检测到",
-            font=("Segoe UI", 9, "bold"),
-            bg="#DCFCE7" if self.vmd_exe_path else "#FEE2E2",
-            fg="#166534" if self.vmd_exe_path else "#991B1B",
-            padx=8,
-            pady=4
-        )
-        self.lbl_vmd_badge.pack(side="left", padx=(0, 6))
-
-        btn_cfg_vmd = ttk.Button(vmd_box, text="配置 VMD 路径...", command=self._on_set_vmd_path)
-        btn_cfg_vmd.pack(side="left")
-
-        # Right: Action Buttons
-        btn_box = tk.Frame(footer, bg=ModernTheme.BG_MAIN)
-        btn_box.pack(side="right")
-
-        btn_copy = ttk.Button(btn_box, text="📋 复制代码", command=self._on_copy_script)
-        btn_copy.pack(side="left", padx=4)
-
-        btn_export = ttk.Button(btn_box, text="💾 导出 .vmd 脚本", command=self._on_save_script)
-        btn_export.pack(side="left", padx=4)
-
-        self.btn_launch = ttk.Button(
-            btn_box,
-            text="🚀 一键在 VMD 中展示",
-            style="Primary.TButton",
-            command=self._on_launch_vmd
-        )
-        self.btn_launch.pack(side="left", padx=6)
-
-        # 5. Bottom Status Bar
-        self.status_bar = tk.Label(
-            self,
-            textvariable=self.status_var,
-            relief="flat",
-            anchor="w",
-            font=("Segoe UI", 8),
-            bg="#E2E8F0",
-            fg=ModernTheme.TEXT_MUTED,
-            padx=14,
-            pady=3
-        )
-        self.status_bar.pack(fill="x", side="bottom")
-
-    def _build_elements_tab(self, parent):
-        top_hint = tk.Frame(parent, bg=ModernTheme.CARD_BG)
-        top_hint.pack(fill="x", pady=(0, 6))
-
+        title_box = tk.Frame(header, bg=Theme.BG)
+        title_box.pack(side="left")
         tk.Label(
-            top_hint,
-            text="💡 根据原子质量自动匹配化学元素与范德华半径。双击任意行即可修改元素符号或半径：",
-            font=("Segoe UI", 9),
-            bg=ModernTheme.CARD_BG,
-            fg=ModernTheme.TEXT_MUTED
+            title_box,
+            text="LAMMPS → VMD",
+            font=FONTS["hero"],
+            bg=Theme.BG,
+            fg=Theme.TEXT,
+        ).pack(anchor="w")
+        tk.Label(
+            title_box,
+            text="拖入文件，调整好样式后再打开 VMD",
+            font=FONTS["small"],
+            bg=Theme.BG,
+            fg=Theme.TEXT_MUTED,
+        ).pack(anchor="w", pady=(2, 0))
+
+        vmd_box = tk.Frame(header, bg=Theme.BG)
+        vmd_box.pack(side="right")
+        self.vmd_badge = tk.Label(
+            vmd_box,
+            text="检测 VMD …",
+            font=FONTS["small_bold"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            padx=10,
+            pady=4,
+        )
+        self.vmd_badge.pack(side="left", padx=(0, 8))
+        tk.Button(
+            vmd_box,
+            text="VMD 路径",
+            font=FONTS["small"],
+            bg=Theme.BG,
+            fg=Theme.TEXT_MUTED,
+            activebackground="#EAEAEA",
+            activeforeground=Theme.TEXT,
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            command=self._on_set_vmd_path,
         ).pack(side="left")
 
-        btn_auto_all = ttk.Button(top_hint, text="↺ 恢复自动匹配", command=self._on_reset_elements)
-        btn_auto_all.pack(side="right")
+        self._top_slot = tk.Frame(self, bg=Theme.BG)
+        self._top_slot.pack(fill="x", padx=26, pady=(8, 0))
+        self.drop_zone = DropZone(self._top_slot, command=self._on_browse, bg=Theme.BG)
+        self.drop_zone.pack(fill="x")
+        self.file_card = self._build_file_card(self._top_slot)
 
-        # Table
-        cols = ("type_id", "mass", "element", "radius", "color", "comment")
-        self.tree_elements = ttk.Treeview(parent, columns=cols, show="headings", height=12)
-        self.tree_elements.heading("type_id", text="Type ID")
-        self.tree_elements.heading("mass", text="Mass (amu)")
-        self.tree_elements.heading("element", text="匹配元素")
-        self.tree_elements.heading("radius", text="范德华半径 (Å)")
-        self.tree_elements.heading("color", text="VMD 颜色")
-        self.tree_elements.heading("comment", text="文件注释说明")
+        self._build_footer()
 
-        self.tree_elements.column("type_id", width=80, anchor="center")
-        self.tree_elements.column("mass", width=110, anchor="center")
-        self.tree_elements.column("element", width=120, anchor="center")
-        self.tree_elements.column("radius", width=130, anchor="center")
-        self.tree_elements.column("color", width=130, anchor="center")
-        self.tree_elements.column("comment", width=260, anchor="w")
+        content = tk.Frame(self, bg=Theme.BG)
+        content.pack(fill="both", expand=True, padx=26, pady=(14, 0))
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=3, minsize=520)
+        content.grid_columnconfigure(1, weight=2, minsize=330)
 
-        sb = ttk.Scrollbar(parent, orient="vertical", command=self.tree_elements.yview)
-        self.tree_elements.configure(yscrollcommand=sb.set)
+        types_card = make_card(content)
+        types_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        self._build_types_card(types_card)
 
-        self.tree_elements.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree_elements.bind("<Double-1>", self._on_tree_double_click)
+        settings_card = make_card(content)
+        settings_card.grid(row=0, column=1, sticky="nsew")
+        self._build_settings_card(settings_card)
 
-    def _build_visual_tab(self, parent):
-        # 2-Column Clean Layout
-        col_left = ttk.LabelFrame(parent, text=" 🌟 视觉主题预设 (Presets) ", padding=12)
-        col_left.pack(side="left", fill="both", expand=True, padx=(0, 6), pady=4)
+    def _build_footer(self) -> None:
+        footer = tk.Frame(self, bg=Theme.BG)
+        footer.pack(side="bottom", fill="x", padx=26, pady=(12, 14))
 
-        presets = [
-            ("publication", "📄 期刊发表标准 (Publication Ready)\n    白底 · Opaque饱和材质 · 正交投影 · 黑色边框"),
-            ("ball_and_stick", "🌌 深色高对比 (Dark Contrast)\n    黑底 · Glossy光泽材质 · 透视投影 · 青色边框"),
-            ("vdw_spacefill", "🔮 真实空间填充 (Space Filling)\n    真实范德华球体填充 · 白底 · 立体无死角"),
-            ("licorice", "🧪 分子骨架 (Licorice Stick)\n    纯骨架棍状模型 · 黑底 · 适合复杂大分子")
+        self.status_label = tk.Label(
+            footer,
+            text="",
+            font=FONTS["small"],
+            bg=Theme.BG,
+            fg=Theme.TEXT_MUTED,
+            anchor="w",
+            justify="left",
+        )
+        self.status_label.pack(side="left", fill="x", expand=True)
+
+        self.btn_launch = tk.Button(
+            footer,
+            text="在 VMD 中显示",
+            font=FONTS["bold"],
+            bg=Theme.ACCENT,
+            fg="#FFFFFF",
+            activebackground=Theme.ACCENT_HOVER,
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=20,
+            pady=9,
+            cursor="hand2",
+            command=self._on_launch,
+        )
+        self.btn_launch.pack(side="right")
+
+        self.btn_export = tk.Button(
+            footer,
+            text="导出脚本",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT,
+            activebackground=Theme.HOVER,
+            activeforeground=Theme.TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=Theme.BORDER_STRONG,
+            padx=14,
+            pady=7,
+            cursor="hand2",
+            command=self._on_export,
+        )
+        self.btn_export.pack(side="right", padx=(0, 10))
+
+    def _build_file_card(self, parent: tk.Misc) -> tk.Frame:
+        card = make_card(parent)
+        inner = tk.Frame(card, bg=Theme.CARD, padx=18, pady=14)
+        inner.pack(fill="both", expand=True)
+
+        top = tk.Frame(inner, bg=Theme.CARD)
+        top.pack(fill="x")
+
+        self.file_badge = tk.Label(
+            top,
+            text="数据文件",
+            font=FONTS["small_bold"],
+            bg=Theme.ACCENT_TINT,
+            fg=Theme.ACCENT,
+            padx=8,
+            pady=3,
+        )
+        self.file_badge.pack(side="left", padx=(0, 10))
+
+        self.file_name_label = tk.Label(
+            top,
+            text="",
+            font=FONTS["title"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT,
+            anchor="w",
+        )
+        self.file_name_label.pack(side="left")
+
+        tk.Button(
+            top,
+            text="更换文件",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            activebackground=Theme.HOVER,
+            activeforeground=Theme.TEXT,
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=4,
+            cursor="hand2",
+            command=self._on_browse,
+        ).pack(side="right")
+        tk.Button(
+            top,
+            text="重新加载",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            activebackground=Theme.HOVER,
+            activeforeground=Theme.TEXT,
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=4,
+            cursor="hand2",
+            command=self._on_reload,
+        ).pack(side="right", padx=(0, 2))
+
+        self.file_path_label = tk.Label(
+            inner,
+            text="",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            anchor="w",
+            justify="left",
+        )
+        self.file_path_label.pack(fill="x", pady=(4, 6))
+        card.bind(
+            "<Configure>",
+            lambda event: self.file_path_label.configure(
+                wraplength=max(240, event.width - 40)
+            ),
+        )
+
+        stats_row = tk.Frame(inner, bg=Theme.CARD)
+        stats_row.pack(fill="x")
+        self.file_stats_label = tk.Label(
+            stats_row,
+            text="",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            anchor="w",
+        )
+        self.file_stats_label.pack(side="left")
+        tk.Label(
+            stats_row,
+            text="可将其他文件直接拖入窗口替换",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_FAINT,
+        ).pack(side="right")
+
+        return card
+
+    def _build_types_card(self, card: tk.Frame) -> None:
+        inner = tk.Frame(card, bg=Theme.CARD, padx=18, pady=16)
+        inner.pack(fill="both", expand=True)
+
+        head = tk.Frame(inner, bg=Theme.CARD)
+        head.pack(fill="x")
+        tk.Label(
+            head,
+            text="原子类型",
+            font=FONTS["title"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT,
+        ).pack(side="left")
+        tk.Label(
+            head,
+            text="点击色块修改颜色 · 半径可直接编辑",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_FAINT,
+        ).pack(side="right")
+
+        self.types_header = tk.Frame(inner, bg=Theme.CARD)
+        self.types_header.pack(fill="x", pady=(14, 6))
+        columns = [
+            ("类型", "w", 54),
+            ("质量", "e", 66),
+            ("半径 (Å)", "center", 72),
+            ("颜色", "center", 50),
+            ("注释说明", "w", 0),
         ]
-        for val, desc in presets:
-            f_r = tk.Frame(col_left, bg=ModernTheme.CARD_BG, pady=4)
-            f_r.pack(fill="x", anchor="w")
-            ttk.Radiobutton(
-                f_r,
-                text=desc,
-                value=val,
-                variable=self.preset_var,
-                command=self._on_preset_change
-            ).pack(anchor="w")
+        for index, (text, anchor, width) in enumerate(columns):
+            if width:
+                self.types_header.grid_columnconfigure(index, minsize=width)
+            label = tk.Label(
+                self.types_header,
+                text=text,
+                font=FONTS["small_bold"],
+                bg=Theme.CARD,
+                fg=Theme.TEXT_MUTED,
+                anchor=anchor,
+            )
+            sticky = "w" if index in (0, 4) else ("e" if index == 1 else "ew")
+            label.grid(row=0, column=index, sticky=sticky, padx=(0, 6))
+        self.types_header.grid_columnconfigure(4, weight=1)
 
-        col_right = ttk.LabelFrame(parent, text=" ⚙️ 详细参数微调 (Tuning) ", padding=12)
-        col_right.pack(side="right", fill="both", expand=True, padx=(6, 0), pady=4)
+        self.types_list = ScrollList(inner, bg=Theme.CARD)
+        self.types_list.pack(fill="both", expand=True)
+        self._render_types()
 
-        # Rep & Color
-        r_grid = tk.Frame(col_right, bg=ModernTheme.CARD_BG)
-        r_grid.pack(fill="both", expand=True)
+    def _build_settings_card(self, card: tk.Frame) -> None:
+        inner = tk.Frame(card, bg=Theme.CARD, padx=18, pady=16)
+        inner.pack(fill="both", expand=True)
 
-        tk.Label(r_grid, text="显示形式:").grid(row=0, column=0, sticky="w", pady=4)
-        c_rep = ttk.Combobox(r_grid, textvariable=self.rep_style_var, values=["CPK", "VDW", "Licorice", "DynamicBonds", "Lines"], width=12, state="readonly")
-        c_rep.grid(row=0, column=1, sticky="w", pady=4, padx=4)
-        c_rep.bind("<<ComboboxSelected>>", lambda e: self.update_script_preview())
+        tk.Label(
+            inner,
+            text="显示设置",
+            font=FONTS["title"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT,
+        ).pack(anchor="w")
 
-        tk.Label(r_grid, text="球体缩放:").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Spinbox(r_grid, from_=0.1, to=2.0, increment=0.05, textvariable=self.sphere_scale_var, width=10, command=self.update_script_preview).grid(row=1, column=1, sticky="w", pady=4, padx=4)
-
-        tk.Label(r_grid, text="化学键粗细(Å):").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Spinbox(r_grid, from_=0.05, to=1.0, increment=0.02, textvariable=self.bond_radius_var, width=10, command=self.update_script_preview).grid(row=2, column=1, sticky="w", pady=4, padx=4)
-
-        tk.Label(r_grid, text="渲染材质:").grid(row=3, column=0, sticky="w", pady=4)
-        c_mat = ttk.Combobox(r_grid, textvariable=self.material_var, values=["Opaque", "Glossy", "Diffuse", "Goodsell", "Transparent"], width=12, state="readonly")
-        c_mat.grid(row=3, column=1, sticky="w", pady=4, padx=4)
-        c_mat.bind("<<ComboboxSelected>>", lambda e: self.update_script_preview())
-
-        tk.Label(r_grid, text="背景颜色:").grid(row=0, column=2, sticky="w", pady=4, padx=(14, 0))
-        c_bg = ttk.Combobox(r_grid, textvariable=self.bg_color_var, values=["white", "black", "gray"], width=10, state="readonly")
-        c_bg.grid(row=0, column=3, sticky="w", pady=4, padx=4)
-        c_bg.bind("<<ComboboxSelected>>", lambda e: self.update_script_preview())
-
-        tk.Label(r_grid, text="视角投影:").grid(row=1, column=2, sticky="w", pady=4, padx=(14, 0))
-        c_proj = ttk.Combobox(r_grid, textvariable=self.projection_var, values=["Orthographic", "Perspective"], width=10, state="readonly")
-        c_proj.grid(row=1, column=3, sticky="w", pady=4, padx=4)
-        c_proj.bind("<<ComboboxSelected>>", lambda e: self.update_script_preview())
-
-        ttk.Checkbutton(r_grid, text="绘制模拟晶胞边界框", variable=self.show_box_var, command=self.update_script_preview).grid(row=2, column=2, columnspan=2, sticky="w", pady=4, padx=(14, 0))
-
-        ttk.Checkbutton(r_grid, text="无键体系自动计算动态键", variable=self.auto_bonds_var, command=self.update_script_preview).grid(row=3, column=2, columnspan=2, sticky="w", pady=4, padx=(14, 0))
-
-    def _build_script_tab(self, parent):
-        self.txt_script = tk.Text(parent, font=("Consolas", 10), bg="#F8FAFC", relief="flat", wrap="none", padx=8, pady=8)
-        sy = ttk.Scrollbar(parent, orient="vertical", command=self.txt_script.yview)
-        sx = ttk.Scrollbar(parent, orient="horizontal", command=self.txt_script.xview)
-        self.txt_script.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
-
-        self.txt_script.pack(side="left", fill="both", expand=True)
-        sy.pack(side="right", fill="y")
-        sx.pack(side="bottom", fill="x")
-
-    def _on_files_dropped(self, files):
-        if not files:
-            return
-        target = files[0]
-        if not os.path.isfile(target):
-            return
-        self.file_path_var.set(target)
-        self.load_file(target)
-        if self.auto_launch_on_drop_var.get():
-            self.status_var.set(f"自动启动 VMD 加载: {os.path.basename(target)}...")
-            self.after(150, self._on_launch_vmd)
-
-    def _on_browse_file(self):
-        f = filedialog.askopenfilename(
-            title="选择 LAMMPS 数据文件",
-            filetypes=[("LAMMPS Data", "*.data *.lmp data.* *.dat"), ("All files", "*.*")]
+        preset_row = tk.Frame(inner, bg=Theme.CARD)
+        preset_row.pack(fill="x", pady=(10, 0))
+        tk.Label(
+            preset_row,
+            text="预设",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            width=8,
+            anchor="w",
+        ).pack(side="left")
+        self.preset_control = SegmentedControl(
+            preset_row,
+            PRESET_OPTIONS,
+            "publication",
+            command=self._on_preset_change,
+            bg=Theme.CARD,
         )
-        if f:
-            self.file_path_var.set(f)
-            self.load_file(f)
+        self.preset_control.pack(side="left", padx=(8, 0))
 
-    def _on_reload_file(self):
-        p = self.file_path_var.get().strip()
-        if p and os.path.isfile(p):
-            self.load_file(p)
+        tk.Frame(inner, bg=Theme.BORDER, height=1).pack(fill="x", pady=(12, 8))
 
-    def load_file(self, filepath: str):
-        try:
-            self.current_info = LammpsDataParser.parse(filepath)
-            self.atom_types_data = dict(self.current_info.atom_types)
-            self.style_var.set(self.current_info.atom_style)
+        form = tk.Frame(inner, bg=Theme.CARD)
+        form.pack(fill="both", expand=True)
+        form.grid_columnconfigure(0, minsize=84)
+        form.grid_columnconfigure(1, weight=1)
 
-            # Update stats badges
-            box_info = "无盒子"
-            if self.current_info.box:
-                b = self.current_info.box
-                b_type = "三斜" if b.is_triclinic else "正交"
-                box_info = f"{b_type} [{b.lx:.2f}×{b.ly:.2f}×{b.lz:.2f} Å]"
+        # Representation
+        self._form_label(form, 0, "表示")
+        self.rep_combo = theme.ttk.Combobox(
+            form,
+            values=[label for label, _key in REP_OPTIONS],
+            state="readonly",
+            width=18,
+        )
+        self.rep_combo.grid(row=0, column=1, sticky="w", pady=5)
+        self.rep_combo.bind("<<ComboboxSelected>>", self._on_rep_changed)
 
-            pills_text = (
-                f"📄 {os.path.basename(filepath)}   |   "
-                f"⚛️ {self.current_info.num_atoms:,} 原子   |   "
-                f"🔗 {self.current_info.num_bonds:,} 键   |   "
-                f"🏷️ {self.current_info.num_atom_types} 种原子类型   |   "
-                f"📦 {box_info}"
-            )
-            self.lbl_pills.config(text=pills_text, fg=ModernTheme.TEXT_MAIN, font=("Segoe UI", 9, "bold"))
+        # Sphere scale
+        self._form_label(form, 1, "球体缩放")
+        sphere_box = tk.Frame(form, bg=Theme.CARD)
+        sphere_box.grid(row=1, column=1, sticky="w", pady=3)
+        self.sphere_slider = ModernSlider(
+            sphere_box, 0.10, 1.50, 0.35, command=self._on_sphere_changed, bg=Theme.CARD
+        )
+        self.sphere_slider.pack(side="left")
+        self.sphere_value = tk.Label(
+            sphere_box, text="0.35", font=FONTS["mono"], bg=Theme.CARD, fg=Theme.TEXT
+        )
+        self.sphere_value.pack(side="left", padx=(8, 0))
 
-            self._refresh_treeview()
-            self.update_script_preview()
-            self.status_var.set(f"成功加载文件 '{os.path.basename(filepath)}'，准备就绪。")
-        except Exception as ex:
-            messagebox.showerror("解析 LAMMPS 数据失败", f"无法解析文件:\n{ex}")
-            self.status_var.set("加载失败。")
+        # Bond radius
+        self._form_label(form, 2, "键半径")
+        bond_box = tk.Frame(form, bg=Theme.CARD)
+        bond_box.grid(row=2, column=1, sticky="w", pady=3)
+        self.bond_slider = ModernSlider(
+            bond_box, 0.05, 0.50, 0.18, command=self._on_bond_changed, bg=Theme.CARD
+        )
+        self.bond_slider.pack(side="left")
+        self.bond_value = tk.Label(
+            bond_box, text="0.18", font=FONTS["mono"], bg=Theme.CARD, fg=Theme.TEXT
+        )
+        self.bond_value.pack(side="left", padx=(8, 0))
 
-    def _refresh_treeview(self):
-        for item in self.tree_elements.get_children():
-            self.tree_elements.delete(item)
+        # Background
+        self._form_label(form, 3, "背景颜色")
+        self.bg_field = ColorField(
+            form,
+            ("#FFFFFF", "#000000", "#808080"),
+            "#FFFFFF",
+            on_change=self._on_bg_changed,
+            bg=Theme.CARD,
+        )
+        self.bg_field.grid(row=3, column=1, sticky="w", pady=5)
 
-        for tid, tdata in sorted(self.atom_types_data.items()):
-            self.tree_elements.insert(
-                "",
-                "end",
-                iid=str(tid),
-                values=(
-                    f"Type {tdata.type_id}",
-                    f"{tdata.mass:.3f}" if tdata.mass > 0 else "0.000",
-                    f"{tdata.element} ({tdata.element_info.name})",
-                    f"{tdata.radius:.2f}",
-                    tdata.color,
-                    tdata.comment
-                )
-            )
+        # Projection
+        self._form_label(form, 4, "投影")
+        self.projection_control = SegmentedControl(
+            form,
+            PROJECTION_OPTIONS,
+            "Orthographic",
+            command=self._on_projection_changed,
+            bg=Theme.CARD,
+        )
+        self.projection_control.grid(row=4, column=1, sticky="w", pady=5)
 
-    def _on_tree_double_click(self, event):
-        item_id = self.tree_elements.focus()
-        if not item_id:
+        # Box + border color
+        self._form_label(form, 5, "晶胞")
+        box_row = tk.Frame(form, bg=Theme.CARD)
+        box_row.grid(row=5, column=1, sticky="w", pady=5)
+        self.box_toggle = ToggleSwitch(
+            box_row, True, command=self._on_box_toggled, bg=Theme.CARD
+        )
+        self.box_toggle.pack(side="left")
+        tk.Label(
+            box_row,
+            text="边框色",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+        ).pack(side="left", padx=(14, 6))
+        self.box_chip = ColorChip(
+            box_row,
+            self.box_color,
+            size=22,
+            command=self._pick_box_color,
+            bg=Theme.CARD,
+            badge=True,
+        )
+        self.box_chip.pack(side="left")
+        self.box_hex = tk.Label(
+            box_row, text=self.box_color, font=FONTS["mono"], bg=Theme.CARD, fg=Theme.TEXT_FAINT
+        )
+        self.box_hex.pack(side="left", padx=(8, 0))
+
+        tk.Label(
+            inner,
+            text="脚本通过 VMD Tk Console 执行 · 无键体系自动生成距离键",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_FAINT,
+            anchor="w",
+            justify="left",
+            wraplength=300,
+        ).pack(side="bottom", anchor="w", pady=(10, 0))
+
+    def _form_label(self, parent: tk.Misc, row: int, text: str) -> None:
+        tk.Label(
+            parent,
+            text=text,
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            anchor="w",
+        ).grid(row=row, column=0, sticky="w", pady=4)
+
+    # ------------------------------------------------------------------
+    # Settings sync
+    # ------------------------------------------------------------------
+    def _apply_preset(self, key: Optional[str]) -> None:
+        if key is None:
             return
-
-        tid = int(item_id)
-        current = self.atom_types_data.get(tid)
-        if not current:
+        settings = VmdScriptGenerator.PRESETS.get(key)
+        if settings is None:
             return
+        self.preset_key = key
+        self.rep_style = settings.rep_style
+        self.sphere_scale = settings.sphere_scale
+        self.bond_radius = settings.bond_radius
+        self.material = settings.material
+        self.bg_color = settings.bg_color
+        self.projection = settings.projection
+        self.show_axes = settings.show_axes
+        self.depthcue = settings.depthcue
+        self.show_box = settings.show_box
+        self.box_color = settings.box_color
 
-        # Simple Dialog to edit element & radius
-        dlg = tk.Toplevel(self)
-        dlg.title(f"修改原子类型 {tid}")
-        dlg.geometry("340x240")
-        dlg.transient(self)
-        dlg.grab_set()
+        self.preset_control.set_value(key)
+        self.rep_combo.set(self._rep_key_to_label.get(self.rep_style, self.rep_style))
+        self.sphere_slider.set(self.sphere_scale)
+        self.sphere_value.configure(text=f"{self.sphere_scale:.2f}")
+        self.bond_slider.set(self.bond_radius)
+        self.bond_value.configure(text=f"{self.bond_radius:.2f}")
+        self.bg_field.set_value(self.bg_color, notify=False)
+        self.projection_control.set_value(self.projection)
+        self.box_toggle.set(self.show_box)
+        self.box_chip.set_color(self.box_color)
+        self.box_hex.configure(text=self.box_color)
 
-        tk.Label(dlg, text=f"Type ID: {tid}  |  质量: {current.mass:.3f} amu", font=("Segoe UI", 9, "bold")).pack(pady=(12, 6))
+    def _mark_custom(self) -> None:
+        self.preset_key = None
+        self.preset_control.set_value(None)
 
-        frame = ttk.Frame(dlg, padding=12)
-        frame.pack(fill="both", expand=True)
+    def _on_preset_change(self, key: str) -> None:
+        self._apply_preset(key)
 
-        ttk.Label(frame, text="化学元素:").grid(row=0, column=0, sticky="w", pady=4)
-        elem_var = tk.StringVar(value=current.element)
-        c_elem = ttk.Combobox(frame, textvariable=elem_var, values=sorted(list(ELEMENTS_DB.keys())), width=12)
-        c_elem.grid(row=0, column=1, sticky="w", pady=4)
+    def _on_rep_changed(self, _event=None) -> None:
+        key = self._rep_label_to_key.get(self.rep_combo.get())
+        if key:
+            self.rep_style = key
+            self._mark_custom()
 
-        ttk.Label(frame, text="范德华半径 (Å):").grid(row=1, column=0, sticky="w", pady=4)
-        rad_var = tk.DoubleVar(value=current.radius)
-        ttk.Entry(frame, textvariable=rad_var, width=14).grid(row=1, column=1, sticky="w", pady=4)
+    def _on_sphere_changed(self, value: float) -> None:
+        self.sphere_scale = round(value, 2)
+        self.sphere_value.configure(text=f"{self.sphere_scale:.2f}")
+        self._mark_custom()
 
-        ttk.Label(frame, text="VMD 颜色:").grid(row=2, column=0, sticky="w", pady=4)
-        col_var = tk.StringVar(value=current.color)
-        c_col = ttk.Combobox(frame, textvariable=col_var, values=["cyan", "red", "white", "blue", "yellow", "green", "silver", "orange", "ochre", "purple"], width=12)
-        c_col.grid(row=2, column=1, sticky="w", pady=4)
+    def _on_bond_changed(self, value: float) -> None:
+        self.bond_radius = round(value, 2)
+        self.bond_value.configure(text=f"{self.bond_radius:.2f}")
+        self._mark_custom()
 
-        def on_elem_changed(e=None):
-            sym = elem_var.get().strip().capitalize()
-            info = get_element_info(sym)
-            if info.symbol != "X":
-                rad_var.set(info.vdw_radius)
-                col_var.set(info.vmd_color)
+    def _on_bg_changed(self, color: str) -> None:
+        self.bg_color = color
+        self._mark_custom()
 
-        c_elem.bind("<<ComboboxSelected>>", on_elem_changed)
+    def _on_projection_changed(self, value: str) -> None:
+        self.projection = value
+        self._mark_custom()
 
-        def on_save():
-            sym = elem_var.get().strip().capitalize()
-            try:
-                rad = float(rad_var.get())
-            except ValueError:
-                rad = 1.5
-            einfo = get_element_info(sym)
-            current.element = sym
-            current.radius = rad
-            current.color = col_var.get().strip() or einfo.vmd_color
-            current.element_info = einfo
+    def _on_box_toggled(self, value: bool) -> None:
+        self.show_box = value
+        self._mark_custom()
 
-            self._refresh_treeview()
-            self.update_script_preview()
-            dlg.destroy()
+    def _pick_box_color(self) -> None:
+        chosen = colorchooser.askcolor(
+            color=self.box_color, title="选择晶胞边框颜色", parent=self
+        )
+        if chosen and chosen[1]:
+            self.box_color = normalize_hex(chosen[1])
+            self.box_chip.set_color(self.box_color)
+            self.box_hex.configure(text=self.box_color)
+            self._mark_custom()
 
-        b_box = ttk.Frame(dlg, padding=10)
-        b_box.pack(fill="x", side="bottom")
-        ttk.Button(b_box, text="取消", command=dlg.destroy).pack(side="right", padx=4)
-        ttk.Button(b_box, text="保存修改", command=on_save).pack(side="right", padx=4)
-
-    def _on_reset_elements(self):
-        if not self.current_info:
-            return
-        for tid, tdata in self.atom_types_data.items():
-            elem, einfo = guess_element_from_mass(tdata.mass, tdata.comment)
-            tdata.element = elem
-            tdata.element_info = einfo
-            tdata.radius = einfo.vdw_radius
-            tdata.color = einfo.vmd_color
-        self._refresh_treeview()
-        self.update_script_preview()
-
-    def _on_preset_change(self):
-        p_key = self.preset_var.get()
-        s = VmdScriptGenerator.PRESETS.get(p_key)
-        if not s:
-            return
-
-        self.rep_style_var.set(s.rep_style)
-        self.sphere_scale_var.set(s.sphere_scale)
-        self.bond_radius_var.set(s.bond_radius)
-        self.color_by_var.set(s.color_by)
-        self.material_var.set(s.material)
-        self.bg_color_var.set(s.bg_color)
-        self.projection_var.set(s.projection)
-        self.show_axes_var.set(s.show_axes)
-        self.show_box_var.set(s.show_box)
-        self.box_color_var.set(s.box_color)
-        self.box_width_var.set(s.box_width)
-
-        self.update_script_preview()
-
-    def _get_current_settings(self) -> VisualSettings:
+    def _settings(self) -> VisualSettings:
         return VisualSettings(
-            rep_style=self.rep_style_var.get(),
-            sphere_scale=self.sphere_scale_var.get(),
-            bond_radius=self.bond_radius_var.get(),
-            color_by=self.color_by_var.get(),
-            material=self.material_var.get(),
-            bg_color=self.bg_color_var.get(),
-            projection=self.projection_var.get(),
-            show_axes=self.show_axes_var.get(),
-            axes_location="lowerleft" if self.show_axes_var.get() else "off",
-            show_box=self.show_box_var.get(),
-            box_color=self.box_color_var.get(),
-            box_width=self.box_width_var.get(),
-            auto_bonds=self.auto_bonds_var.get(),
-            bond_cutoff=self.bond_cutoff_var.get()
+            preset_name=self.preset_key or "custom",
+            rep_style=self.rep_style,
+            sphere_scale=self.sphere_scale,
+            bond_radius=self.bond_radius,
+            material=self.material,
+            bg_color=self.bg_color,
+            projection=self.projection,
+            show_axes=self.show_axes,
+            depthcue=self.depthcue,
+            show_box=self.show_box,
+            box_color=self.box_color,
+            box_width=1.5,
+            auto_bonds=self.auto_bonds,
+            bond_cutoff=1.6,
         )
 
-    def generate_script_content(self) -> str:
-        if not self.current_info:
-            return "# 请先在上方选择或拖入 LAMMPS .data 文件。\n"
-        s = self._get_current_settings()
-        return VmdScriptGenerator.generate(
-            info=self.current_info,
-            atom_types=self.atom_types_data,
-            settings=s,
-            custom_atom_style=self.style_var.get()
+    # ------------------------------------------------------------------
+    # File loading
+    # ------------------------------------------------------------------
+    def _on_files_dropped(self, files: List[str]) -> None:
+        if files:
+            self._load_file(files[0])
+
+    def _on_browse(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="选择 LAMMPS data 或轨迹文件",
         )
+        if path:
+            self._load_file(path)
 
-    def update_script_preview(self):
-        script = self.generate_script_content()
-        self.txt_script.delete("1.0", "end")
-        self.txt_script.insert("1.0", script)
-
-    def _on_copy_script(self):
-        script = self.generate_script_content()
-        self.clipboard_clear()
-        self.clipboard_append(script)
-        self.status_var.set("已复制 VMD Tcl 脚本到剪贴板！")
-
-    def _on_save_script(self):
-        if not self.current_info:
-            messagebox.showwarning("提示", "请先载入 LAMMPS 数据文件。")
+    def _on_reload(self) -> None:
+        if not self.current_path:
             return
-        default_name = os.path.splitext(os.path.basename(self.current_info.filepath))[0] + "_view.vmd"
-        out_path = filedialog.asksaveasfilename(
-            title="保存 VMD 脚本",
-            defaultextension=".vmd",
-            initialfile=default_name,
-            filetypes=[("VMD Script", "*.vmd *.tcl"), ("All Files", "*.*")]
-        )
-        if out_path:
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(self.generate_script_content())
-            self.status_var.set(f"脚本已保存至: {out_path}")
-            messagebox.showinfo("已保存", f"VMD 渲染脚本保存成功：\n{out_path}")
+        if self._load_file(self.current_path):
+            self._set_status(f"已重新加载 {os.path.basename(self.current_path)}")
 
-    def _on_set_vmd_path(self):
-        chosen = filedialog.askopenfilename(
-            title="选择 VMD 主执行文件 (vmd.exe)",
-            filetypes=[("VMD Executable", "vmd.exe vmd"), ("All Files", "*.*")]
-        )
-        if chosen and os.path.isfile(chosen):
-            self.vmd_exe_path = chosen
-            save_config({"vmd_path": chosen})
-            self.lbl_vmd_badge.config(
-                text=f"● VMD: {os.path.basename(chosen)}",
-                bg="#DCFCE7",
-                fg="#166534"
-            )
-            self.status_var.set(f"已设置 VMD 路径: {chosen}")
-
-    def _on_launch_vmd(self):
-        if not self.current_info:
-            messagebox.showwarning("提示", "请先载入 LAMMPS 数据文件。")
-            return
-
-        if not self.vmd_exe_path or not os.path.isfile(self.vmd_exe_path):
-            self._on_set_vmd_path()
-            if not self.vmd_exe_path:
-                return
-
-        script_text = self.generate_script_content()
-        temp_dir = tempfile.gettempdir()
-        script_file = os.path.join(temp_dir, "lammps_vmd_launch.vmd")
-        with open(script_file, "w", encoding="utf-8") as f:
-            f.write(script_text)
-
+    def _load_file(self, path: str) -> bool:
+        self._set_status(f"正在读取 {os.path.basename(path)} …")
+        self.update_idletasks()
         try:
-            launch_vmd(script_file, self.vmd_exe_path)
-            self.status_var.set("已成功启动 VMD 渲染展示！")
-        except Exception as ex:
-            messagebox.showerror("启动 VMD 失败", f"无法启动 VMD:\n{ex}")
+            info = LammpsDataParser.parse(path)
+        except InvalidEncodingError as exc:
+            messagebox.showerror("编码错误", str(exc), parent=self)
+            self._set_status("加载失败：文件不是 UTF-8 编码")
+            return False
+        except LammpsFileError as exc:
+            messagebox.showerror("无法加载文件", str(exc), parent=self)
+            self._set_status("加载失败：无法识别文件内容")
+            return False
+        except Exception as exc:
+            messagebox.showerror(
+                "无法加载文件", f"读取文件时发生错误：\n{exc}", parent=self
+            )
+            self._set_status("加载失败")
+            return False
+
+        self.info = info
+        self.current_path = os.path.abspath(path)
+        self.atom_types = dict(info.atom_types)
+        self._show_file_card()
+        self._render_types()
+        self._update_actions()
+        self._set_status(
+            f"已加载 {os.path.basename(self.current_path)} · "
+            f"{info.num_atoms:,} 原子 · 调整后点击“在 VMD 中显示”"
+        )
+        return True
+
+    def _show_file_card(self) -> None:
+        self.drop_zone.pack_forget()
+        if not self._file_card_visible:
+            self.file_card.pack(fill="x")
+            self._file_card_visible = True
+
+        info = self.info
+        if info is None:
+            return
+
+        self.file_badge.configure(
+            text="数据文件" if info.file_type == "data" else "轨迹文件"
+        )
+        self.file_name_label.configure(
+            text=_shorten(os.path.basename(info.filepath), 58)
+        )
+        self.file_path_label.configure(text=info.filepath)
+
+        parts = [f"{info.num_atoms:,} 原子"]
+        if info.file_type == "data":
+            parts.append(f"{info.num_bonds:,} 键")
+        parts.append(f"{len(info.atom_types):,} 种类型")
+        if info.box:
+            box = info.box
+            box_kind = "三斜晶胞" if box.is_triclinic else "正交晶胞"
+            parts.append(
+                f"{box_kind} {box.lx:.2f} × {box.ly:.2f} × {box.lz:.2f} Å"
+            )
+        else:
+            parts.append("无晶胞信息")
+        self.file_stats_label.configure(text="  ·  ".join(parts))
+
+    def _render_types(self) -> None:
+        self.types_list.clear()
+        if not self.atom_types:
+            tk.Label(
+                self.types_list.inner,
+                text="尚未加载文件" if self.info is None else "该文件未提供原子类型",
+                font=FONTS["small"],
+                bg=Theme.CARD,
+                fg=Theme.TEXT_FAINT,
+            ).pack(pady=44)
+            return
+
+        for atom_type in sorted(self.atom_types.values(), key=lambda item: item.type_id):
+            self._add_type_row(atom_type)
+
+    def _add_type_row(self, atom_type: AtomTypeData) -> None:
+        row = tk.Frame(self.types_list.inner, bg=Theme.CARD)
+        row.pack(fill="x")
+        for index, width in enumerate((54, 66, 72, 50)):
+            row.grid_columnconfigure(index, minsize=width)
+        row.grid_columnconfigure(4, weight=1)
+
+        tk.Label(
+            row,
+            text=str(atom_type.type_id),
+            font=FONTS["bold"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=7)
+
+        mass_text = "—" if atom_type.mass <= 0 else f"{atom_type.mass:.3f}"
+        tk.Label(
+            row,
+            text=mass_text,
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT_MUTED,
+            anchor="e",
+        ).grid(row=0, column=1, sticky="e", padx=(0, 8), pady=7)
+
+        radius_var = tk.StringVar(value=f"{atom_type.radius:.3f}")
+        radius_entry = tk.Entry(
+            row,
+            textvariable=radius_var,
+            font=FONTS["mono"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=Theme.CARD,
+            highlightcolor=Theme.ACCENT,
+            justify="center",
+            width=7,
+        )
+        radius_entry.grid(row=0, column=2, sticky="ew", padx=(0, 8), pady=4)
+
+        def commit_radius(var=radius_var, data=atom_type) -> None:
+            try:
+                value = float(var.get())
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                var.set(f"{data.radius:.3f}")
+                return
+            data.radius = value
+            var.set(f"{value:.3f}")
+
+        radius_entry.bind("<Return>", lambda _event: commit_radius())
+        radius_entry.bind("<FocusOut>", lambda _event: commit_radius())
+
+        chip = ColorChip(
+            row,
+            atom_type.color,
+            size=20,
+            bg=Theme.CARD,
+            command=lambda data=atom_type: self._pick_type_color(data),
+        )
+        chip.grid(row=0, column=3, sticky="w", padx=(0, 10), pady=6)
+
+        comment = atom_type.comment.strip()
+        tk.Label(
+            row,
+            text=comment if comment else "—",
+            font=FONTS["small"],
+            bg=Theme.CARD,
+            fg=Theme.TEXT if comment else Theme.TEXT_FAINT,
+            anchor="w",
+        ).grid(row=0, column=4, sticky="ew", pady=7)
+
+        tk.Frame(self.types_list.inner, bg="#F0F0F0", height=1).pack(fill="x")
+
+    def _pick_type_color(self, atom_type: AtomTypeData) -> None:
+        chosen = colorchooser.askcolor(
+            color=atom_type.color,
+            title=f"选择类型 {atom_type.type_id} 的颜色",
+            parent=self,
+        )
+        if chosen and chosen[1]:
+            atom_type.color = normalize_hex(chosen[1])
+            self._render_types()
+
+    # ------------------------------------------------------------------
+    # VMD launch / export
+    # ------------------------------------------------------------------
+    def _update_actions(self) -> None:
+        enabled = self.info is not None
+        state = "normal" if enabled else "disabled"
+        self.btn_launch.configure(
+            state=state,
+            bg=Theme.ACCENT if enabled else "#C9C9C9",
+            activebackground=Theme.ACCENT_HOVER if enabled else "#C9C9C9",
+            cursor="hand2" if enabled else "arrow",
+        )
+        self.btn_export.configure(
+            state=state,
+            fg=Theme.TEXT if enabled else Theme.TEXT_FAINT,
+            cursor="hand2" if enabled else "arrow",
+        )
+
+    def _update_vmd_status(self) -> None:
+        if self.vmd_exe and os.path.isfile(self.vmd_exe):
+            folder = os.path.basename(os.path.dirname(self.vmd_exe))
+            text = f"VMD 已就绪 · {folder}" if folder else "VMD 已就绪"
+            self.vmd_badge.configure(text=text, bg=Theme.SUCCESS_TINT, fg=Theme.SUCCESS)
+        else:
+            self.vmd_badge.configure(
+                text="未找到 VMD", bg=Theme.DANGER_TINT, fg=Theme.DANGER
+            )
+
+    def _on_set_vmd_path(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="选择 VMD 主程序 (vmd.exe)",
+            filetypes=[("VMD 可执行文件", "vmd.exe"), ("所有文件", "*.*")],
+        )
+        if path and os.path.isfile(path):
+            self.vmd_exe = path
+            save_config({"vmd_path": path})
+            self._update_vmd_status()
+            self._set_status(f"VMD 路径已设置：{path}")
+
+    def _ensure_vmd(self) -> bool:
+        if self.vmd_exe and os.path.isfile(self.vmd_exe):
+            return True
+        detected = find_vmd_executable()
+        if detected:
+            self.vmd_exe = detected
+            self._update_vmd_status()
+            return True
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="未检测到 VMD，请选择 vmd.exe",
+            filetypes=[("VMD 可执行文件", "vmd.exe"), ("所有文件", "*.*")],
+        )
+        if path and os.path.isfile(path):
+            self.vmd_exe = path
+            save_config({"vmd_path": path})
+            self._update_vmd_status()
+            return True
+        self._set_status("未找到 VMD，请先设置 VMD 路径")
+        return False
+
+    def generate_script(self) -> str:
+        if self.info is None:
+            return "# No LAMMPS file loaded\n"
+        return VmdScriptGenerator.generate(
+            info=self.info,
+            atom_types=self.atom_types,
+            settings=self._settings(),
+        )
+
+    def _on_launch(self) -> None:
+        self._launch_vmd()
+
+    def _launch_vmd(self) -> None:
+        if self.info is None:
+            messagebox.showwarning("提示", "请先加载 LAMMPS 文件。", parent=self)
+            return
+        if not self._ensure_vmd():
+            return
+
+        script = self.generate_script()
+        try:
+            fd, script_path = tempfile.mkstemp(prefix="lammps_vmd_", suffix=".vmd")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(script)
+            launch_vmd(script_path, self.vmd_exe)
+        except Exception as exc:
+            messagebox.showerror("启动 VMD 失败", f"无法启动 VMD：\n{exc}", parent=self)
+            self._set_status("启动 VMD 失败")
+            return
+        self._set_status(
+            f"已在 VMD 中打开 {os.path.basename(self.info.filepath)}"
+        )
+
+    def _on_export(self) -> None:
+        if self.info is None:
+            return
+        base = os.path.splitext(os.path.basename(self.info.filepath))[0]
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="导出 VMD 脚本",
+            initialfile=f"{base}_view.vmd",
+            defaultextension=".vmd",
+            filetypes=[("VMD / Tcl 脚本", "*.vmd"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(self.generate_script())
+        except OSError as exc:
+            messagebox.showerror("导出失败", f"无法写入文件：\n{exc}", parent=self)
+            return
+        self._set_status(f"脚本已导出：{path}")
+
+    def _set_status(self, text: str) -> None:
+        self.status_label.configure(text=text)
 
 
-def main():
+def main() -> None:
+    _enable_dpi_awareness()
     initial_file = ""
-    auto_launch = False
-    if len(sys.argv) > 1:
-        for arg in sys.argv[1:]:
-            if arg in ("--launch", "-l"):
-                auto_launch = True
-            elif not arg.startswith("-") and os.path.isfile(arg):
-                initial_file = arg
-
-    app = LammpsVmdApp(initial_file=initial_file, auto_launch=auto_launch)
+    for argument in sys.argv[1:]:
+        if not argument.startswith("-") and os.path.isfile(argument):
+            initial_file = argument
+            break
+    app = LammpsVmdApp(initial_file=initial_file)
     app.mainloop()
 
 

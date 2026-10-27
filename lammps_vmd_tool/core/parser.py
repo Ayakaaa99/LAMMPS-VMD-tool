@@ -1,32 +1,72 @@
 """
-LAMMPS Data file parser.
-Extracts header information, simulation box, masses, atom types, and auto-detects atom style.
+LAMMPS data / trajectory parser.
+
+Supports:
+- LAMMPS data files (orthogonal and triclinic boxes, any file suffix).
+- LAMMPS text dump trajectories (``lammpstrj`` / ``dump`` / custom columns).
+
+Files are read strictly as UTF-8. A dedicated exception is raised when the
+file cannot be decoded so the GUI can show an explicit error dialog.
 """
 
-from dataclasses import dataclass, field
+from __future__ import annotations
+
 import os
 import re
-from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from .box_math import SimulationBox
-from .periodic_table import guess_element_from_mass, get_element_info, ElementInfo
+from .periodic_table import (
+    ELEMENTS_DB,
+    ElementInfo,
+    UNKNOWN_ELEMENT,
+    guess_element_from_mass,
+)
+
+
+class LammpsFileError(ValueError):
+    """Raised when a file cannot be interpreted as LAMMPS input."""
+
+
+class InvalidEncodingError(LammpsFileError):
+    """Raised when the file is not valid UTF-8 text."""
+
+
+# Fallback palette for atom types whose element cannot be inferred.
+TYPE_COLOR_PALETTE = [
+    "#E15759",
+    "#4E79A7",
+    "#59A14F",
+    "#F28E2B",
+    "#B07AA1",
+    "#76B7B2",
+    "#EDC948",
+    "#FF9DA7",
+    "#9C755F",
+    "#BAB0AC",
+]
+
+# Atom styles accepted by TopoTools / topo readlammpsdata.
+STYLE_FALLBACKS = ("full", "molecular", "bond", "angle", "charge", "atomic", "dipole")
 
 
 @dataclass
 class AtomTypeData:
     type_id: int
-    mass: float
-    comment: str
-    element: str
-    element_info: ElementInfo
-    radius: float
-    color: str
+    mass: float = 0.0
+    comment: str = ""
+    element: str = "X"
+    element_info: ElementInfo = field(default_factory=lambda: UNKNOWN_ELEMENT)
+    radius: float = 1.5
+    color: str = "#BAB0AC"  # Hex color used by the GUI and the Tcl generator
 
 
 @dataclass
 class LammpsDataInfo:
     filepath: str
-    title: str
+    file_type: str = "data"  # "data" or "dump"
+    title: str = ""
     num_atoms: int = 0
     num_atom_types: int = 0
     num_bonds: int = 0
@@ -39,285 +79,466 @@ class LammpsDataInfo:
     atom_style: str = "full"
     atom_style_detected: bool = False
     atom_types: Dict[int, AtomTypeData] = field(default_factory=dict)
-    sample_atoms: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def is_trajectory(self) -> bool:
+        return self.file_type == "dump"
+
+    def style_candidates(self) -> List[str]:
+        """Styles to try in TopoTools, detected style first."""
+        styles: List[str] = []
+        if self.atom_style_detected:
+            styles.append(self.atom_style)
+        for style in STYLE_FALLBACKS:
+            if style not in styles:
+                styles.append(style)
+        return styles
 
 
 class LammpsDataParser:
-    """Parser for LAMMPS data files."""
+    """Parses LAMMPS data files and dump trajectories."""
 
-    KNOWN_STYLES = ["full", "molecular", "atomic", "charge", "dipole", "metal"]
+    KNOWN_STYLES = ["full", "molecular", "atomic", "charge", "dipole", "metal", "bond", "angle"]
+
+    SECTION_NAMES = (
+        "masses",
+        "atoms",
+        "velocities",
+        "bonds",
+        "angles",
+        "dihedrals",
+        "impropers",
+        "pair coeffs",
+        "bond coeffs",
+        "angle coeffs",
+        "dihedral coeffs",
+        "improper coeffs",
+    )
+
+    MAX_ATOM_SAMPLE = 60_000
 
     @classmethod
     def parse(cls, filepath: str) -> LammpsDataInfo:
         if not os.path.isfile(filepath):
-            raise FileNotFoundError(f"File not found: {filepath}")
+            raise FileNotFoundError(f"文件不存在: {filepath}")
 
-        info = LammpsDataInfo(filepath=os.path.abspath(filepath), title="")
-        
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        if cls._detect_kind(filepath) == "dump":
+            return cls._parse_dump(filepath)
+        return cls._parse_data(filepath)
 
-        if not lines:
-            raise ValueError("Empty LAMMPS data file")
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def _iter_lines(cls, filepath: str) -> Iterator[str]:
+        """Yields text lines, raising InvalidEncodingError for non-UTF-8 files."""
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    yield line
+        except UnicodeDecodeError as exc:
+            raise InvalidEncodingError(
+                "文件不是有效的 UTF-8 编码，无法读取。请将其转换为 UTF-8 后重试。"
+            ) from exc
+        except OSError as exc:
+            raise LammpsFileError(f"无法读取文件: {exc}") from exc
 
-        # First line is title / description
-        info.title = lines[0].strip()
+    @classmethod
+    def _detect_kind(cls, filepath: str) -> str:
+        for index, line in enumerate(cls._iter_lines(filepath)):
+            if index >= 60:
+                break
+            text = line.strip()
+            if text.upper().startswith("ITEM:"):
+                return "dump"
+        return "data"
 
-        # Parse header
-        line_idx = 1
-        num_lines = len(lines)
+    @staticmethod
+    def _palette_color(type_id: int) -> str:
+        return TYPE_COLOR_PALETTE[(max(type_id, 1) - 1) % len(TYPE_COLOR_PALETTE)]
+
+    @classmethod
+    def _make_type(cls, type_id: int, mass: float, comment: str) -> AtomTypeData:
+        element, element_info = guess_element_from_mass(mass, comment)
+        if element == "X" or element_info is UNKNOWN_ELEMENT:
+            color = cls._palette_color(type_id)
+        else:
+            color = element_info.hex_color
+        return AtomTypeData(
+            type_id=type_id,
+            mass=mass,
+            comment=comment,
+            element=element,
+            element_info=element_info,
+            radius=element_info.vdw_radius,
+            color=color,
+        )
+
+    @staticmethod
+    def _parse_bounds_block(rows: List[List[float]]) -> Optional[SimulationBox]:
+        """Converts the three dump BOX BOUNDS rows into a SimulationBox."""
+        if len(rows) != 3 or any(len(row) < 2 for row in rows):
+            return None
+
+        is_triclinic = any(len(row) >= 3 for row in rows)
+        if is_triclinic:
+            xlo_bound, xhi_bound, xy = (rows[0] + [0.0, 0.0, 0.0])[:3]
+            ylo_bound, yhi_bound, xz = (rows[1] + [0.0, 0.0, 0.0])[:3]
+            zlo_bound, zhi_bound, yz = (rows[2] + [0.0, 0.0, 0.0])[:3]
+
+            xlo = xlo_bound - min(0.0, xy, xz, xy + xz)
+            xhi = xhi_bound - max(0.0, xy, xz, xy + xz)
+            ylo = ylo_bound - min(0.0, yz)
+            yhi = yhi_bound - max(0.0, yz)
+            zlo, zhi = zlo_bound, zhi_bound
+
+            return SimulationBox(
+                xlo=xlo,
+                xhi=xhi,
+                ylo=ylo,
+                yhi=yhi,
+                zlo=zlo,
+                zhi=zhi,
+                xy=xy,
+                xz=xz,
+                yz=yz,
+                is_triclinic=True,
+            )
+
+        return SimulationBox(
+            xlo=rows[0][0],
+            xhi=rows[0][1],
+            ylo=rows[1][0],
+            yhi=rows[1][1],
+            zlo=rows[2][0],
+            zhi=rows[2][1],
+        )
+
+    # ------------------------------------------------------------------
+    # Data file
+    # ------------------------------------------------------------------
+    @classmethod
+    def _parse_data(cls, filepath: str) -> LammpsDataInfo:
+        info = LammpsDataInfo(filepath=os.path.abspath(filepath), file_type="data")
+
+        num_lines = 0
+        masses: Dict[int, Tuple[float, str]] = {}
+        atom_sample: List[str] = []
+        current_section: Optional[str] = None
 
         xlo = xhi = ylo = yhi = zlo = zhi = 0.0
         xy = xz = yz = 0.0
         is_triclinic = False
         box_parsed = False
 
-        sections: Dict[str, int] = {}  # section name -> line number
+        for index, raw_line in enumerate(cls._iter_lines(filepath)):
+            num_lines += 1
+            if index == 0:
+                info.title = raw_line.strip()
+                continue
 
-        # Section keywords in LAMMPS data files
-        section_names = {
-            "masses", "atoms", "velocities", "bonds", "angles",
-            "dihedrals", "impropers", "pair coeffs", "bond coeffs",
-            "angle coeffs", "dihedral coeffs", "improper coeffs"
-        }
-
-        while line_idx < num_lines:
-            raw_line = lines[line_idx]
-            clean_line = raw_line.split("#")[0].strip()
-            
-            # Check if this line starts a section
+            clean_line = raw_line.split("#", 1)[0].strip()
             lower_clean = clean_line.lower()
-            matched_section = None
-            for sec in section_names:
-                if lower_clean == sec or lower_clean.startswith(sec + " "):
-                    matched_section = sec
-                    break
-            
-            # Also check if raw line has comments like "Atoms # full"
-            lower_raw = raw_line.strip().lower()
-            for sec in section_names:
-                if lower_raw.startswith(sec):
-                    matched_section = sec
-                    # Check for inline style hint e.g., "Atoms # full"
-                    if sec == "atoms" and "#" in raw_line:
-                        comment_part = raw_line.split("#", 1)[1].strip().lower()
-                        for s in cls.KNOWN_STYLES:
-                            if s in comment_part:
-                                info.atom_style = s
-                                info.atom_style_detected = True
-                    break
 
+            # Section headers
+            matched_section = None
+            for section in cls.SECTION_NAMES:
+                if lower_clean == section or lower_clean.startswith(section + " "):
+                    matched_section = section
+                    break
             if matched_section:
-                sections[matched_section] = line_idx
-                line_idx += 1
+                current_section = matched_section
+                if matched_section == "atoms":
+                    hint = cls._style_from_line(raw_line)
+                    if hint:
+                        info.atom_style = hint
+                        info.atom_style_detected = True
                 continue
 
             if not clean_line:
-                line_idx += 1
                 continue
 
             # Header counts
-            m = re.match(r"^(\d+)\s+atoms\b", clean_line, re.I)
-            if m:
-                info.num_atoms = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+atoms\b", clean_line, re.I)
+            if match:
+                info.num_atoms = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+atom types\b", clean_line, re.I)
-            if m:
-                info.num_atom_types = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+atom\s+types\b", clean_line, re.I)
+            if match:
+                info.num_atom_types = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+bonds\b", clean_line, re.I)
-            if m:
-                info.num_bonds = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+bonds\b", clean_line, re.I)
+            if match:
+                info.num_bonds = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+bond types\b", clean_line, re.I)
-            if m:
-                info.num_bond_types = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+bond\s+types\b", clean_line, re.I)
+            if match:
+                info.num_bond_types = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+angles\b", clean_line, re.I)
-            if m:
-                info.num_angles = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+angles\b", clean_line, re.I)
+            if match:
+                info.num_angles = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+angle types\b", clean_line, re.I)
-            if m:
-                info.num_angle_types = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+angle\s+types\b", clean_line, re.I)
+            if match:
+                info.num_angle_types = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+dihedrals\b", clean_line, re.I)
-            if m:
-                info.num_dihedrals = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+dihedrals\b", clean_line, re.I)
+            if match:
+                info.num_dihedrals = int(match.group(1))
                 continue
-
-            m = re.match(r"^(\d+)\s+impropers\b", clean_line, re.I)
-            if m:
-                info.num_impropers = int(m.group(1))
-                line_idx += 1
+            match = re.match(r"^(\d+)\s+impropers\b", clean_line, re.I)
+            if match:
+                info.num_impropers = int(match.group(1))
                 continue
 
             # Box bounds
-            m = re.match(r"^([-\d\.eE+]+)\s+([-\d\.eE+]+)\s+xlo\s+xhi\b", clean_line, re.I)
-            if m:
-                xlo, xhi = float(m.group(1)), float(m.group(2))
+            match = re.match(r"^([-\d.eE+]+)\s+([-\d.eE+]+)\s+xlo\s+xhi\b", clean_line, re.I)
+            if match:
+                xlo, xhi = float(match.group(1)), float(match.group(2))
                 box_parsed = True
-                line_idx += 1
                 continue
-
-            m = re.match(r"^([-\d\.eE+]+)\s+([-\d\.eE+]+)\s+ylo\s+yhi\b", clean_line, re.I)
-            if m:
-                ylo, yhi = float(m.group(1)), float(m.group(2))
+            match = re.match(r"^([-\d.eE+]+)\s+([-\d.eE+]+)\s+ylo\s+yhi\b", clean_line, re.I)
+            if match:
+                ylo, yhi = float(match.group(1)), float(match.group(2))
                 box_parsed = True
-                line_idx += 1
                 continue
-
-            m = re.match(r"^([-\d\.eE+]+)\s+([-\d\.eE+]+)\s+zlo\s+zhi\b", clean_line, re.I)
-            if m:
-                zlo, zhi = float(m.group(1)), float(m.group(2))
+            match = re.match(r"^([-\d.eE+]+)\s+([-\d.eE+]+)\s+zlo\s+zhi\b", clean_line, re.I)
+            if match:
+                zlo, zhi = float(match.group(1)), float(match.group(2))
                 box_parsed = True
-                line_idx += 1
                 continue
-
-            m = re.match(r"^([-\d\.eE+]+)\s+([-\d\.eE+]+)\s+([-\d\.eE+]+)\s+xy\s+xz\s+yz\b", clean_line, re.I)
-            if m:
-                xy, xz, yz = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            match = re.match(
+                r"^([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s+xy\s+xz\s+yz\b",
+                clean_line,
+                re.I,
+            )
+            if match:
+                xy, xz, yz = float(match.group(1)), float(match.group(2)), float(match.group(3))
                 is_triclinic = True
-                line_idx += 1
                 continue
 
-            line_idx += 1
+            if current_section == "masses":
+                tokens = clean_line.split()
+                if len(tokens) >= 2 and tokens[0].isdigit():
+                    try:
+                        mass = float(tokens[1])
+                    except ValueError:
+                        continue
+                    comment = ""
+                    if "#" in raw_line:
+                        comment = raw_line.split("#", 1)[1].strip()
+                    masses[int(tokens[0])] = (mass, comment)
+
+            elif current_section == "atoms":
+                if not raw_line.lstrip().startswith("#"):
+                    atom_sample.append(clean_line)
+
+            # Masses precede Atoms in conventional data files; stop after a
+            # small atom sample so very large files load instantly.
+            if len(atom_sample) >= 20 and current_section == "atoms":
+                break
+
+        if num_lines == 0:
+            raise LammpsFileError("文件为空。")
+        if not info.num_atoms and not masses and not box_parsed:
+            raise LammpsFileError(
+                "无法识别该文件：既不是 LAMMPS data 文件，也不是 LAMMPS dump 轨迹文件。"
+            )
 
         if box_parsed:
             info.box = SimulationBox(
-                xlo=xlo, xhi=xhi,
-                ylo=ylo, yhi=yhi,
-                zlo=zlo, zhi=zhi,
-                xy=xy, xz=xz, yz=yz,
-                is_triclinic=is_triclinic
+                xlo=xlo,
+                xhi=xhi,
+                ylo=ylo,
+                yhi=yhi,
+                zlo=zlo,
+                zhi=zhi,
+                xy=xy,
+                xz=xz,
+                yz=yz,
+                is_triclinic=is_triclinic,
             )
 
-        # Parse Masses section
-        raw_masses: Dict[int, Tuple[float, str]] = {}
-        if "masses" in sections:
-            m_idx = sections["masses"] + 1
-            while m_idx < num_lines:
-                line = lines[m_idx].strip()
-                m_idx += 1
-                if not line:
-                    continue
-                # If we encounter another section keyword, stop
-                first_word = line.split()[0].lower()
-                if first_word in section_names:
-                    break
-                
-                comment = ""
-                if "#" in line:
-                    parts = line.split("#", 1)
-                    line_data = parts[0].strip()
-                    comment = parts[1].strip()
-                else:
-                    line_data = line
-
-                tokens = line_data.split()
-                if len(tokens) >= 2:
-                    try:
-                        tid = int(tokens[0])
-                        mass = float(tokens[1])
-                        raw_masses[tid] = (mass, comment)
-                    except ValueError:
-                        continue
-
-        # Parse Atoms section to detect style and grab sample atoms
-        atom_lines = []
-        if "atoms" in sections:
-            a_idx = sections["atoms"] + 1
-            while a_idx < num_lines:
-                line = lines[a_idx].strip()
-                a_idx += 1
-                if not line:
-                    continue
-                first_word = line.split()[0].lower()
-                if first_word in section_names:
-                    break
-                
-                # Exclude comment-only lines
-                if line.startswith("#"):
-                    continue
-
-                atom_lines.append(line)
-                if len(atom_lines) >= 20:  # Grab first 20 for style detection & sample
-                    break
-
-        # Detect atom style if not already detected from section comment
-        if not info.atom_style_detected and atom_lines:
-            info.atom_style = cls._detect_atom_style(atom_lines, info.num_bonds, info.num_atom_types)
+        if not info.atom_style_detected and atom_sample:
+            info.atom_style = cls._detect_atom_style(atom_sample, info.num_bonds)
             info.atom_style_detected = True
 
-        # Process atom types (1 to num_atom_types)
-        num_types = info.num_atom_types or max(raw_masses.keys(), default=1)
-        for tid in range(1, num_types + 1):
-            mass, comment = raw_masses.get(tid, (0.0, ""))
-            elem, elem_info = guess_element_from_mass(mass, comment)
-            info.atom_types[tid] = AtomTypeData(
-                type_id=tid,
-                mass=mass,
-                comment=comment,
-                element=elem,
-                element_info=elem_info,
-                radius=elem_info.vdw_radius,
-                color=elem_info.vmd_color
-            )
+        type_count = info.num_atom_types or (max(masses) if masses else 0)
+        for type_id in range(1, type_count + 1):
+            mass, comment = masses.get(type_id, (0.0, ""))
+            info.atom_types[type_id] = cls._make_type(type_id, mass, comment)
+        info.num_atom_types = len(info.atom_types)
 
         return info
 
     @classmethod
-    def _detect_atom_style(cls, sample_lines: List[str], num_bonds: int, num_types: int) -> str:
-        """
-        Detects atom_style from column structure:
-        - full: id mol type q x y z (7 cols, or 10 with ix iy iz)
-        - molecular: id mol type x y z (6 cols, or 9 with ix iy iz)
-        - charge: id type q x y z (6 cols, or 9 with ix iy iz)
-        - atomic: id type x y z (5 cols, or 8 with ix iy iz)
-        """
-        first_line = sample_lines[0].split("#")[0].strip()
-        tokens = first_line.split()
-        ncols = len(tokens)
+    def _style_from_line(cls, raw_line: str) -> Optional[str]:
+        if "#" not in raw_line:
+            return None
+        comment = raw_line.split("#", 1)[1].strip().lower()
+        for style in cls.KNOWN_STYLES:
+            if re.search(rf"\b{re.escape(style)}\b", comment):
+                return style
+        return None
 
-        # 5 or 8 columns: atomic
-        if ncols in (5, 8):
-            return "atomic"
-
-        # 7 or 10 columns: full
-        if ncols in (7, 10):
+    @classmethod
+    def _detect_atom_style(cls, sample_lines: List[str], num_bonds: int) -> str:
+        """
+        Detects atom_style from the column count:
+        - atomic: id type x y z (5 / 8 cols)
+        - full: id mol type q x y z (7 / 10 cols)
+        - charge: id type q x y z (6 / 9 cols)
+        - molecular / bond / angle: id mol type x y z (6 / 9 cols)
+        """
+        if not sample_lines:
             return "full"
 
-        # 6 or 9 columns: could be molecular or charge
+        tokens = sample_lines[0].split("#", 1)[0].split()
+        ncols = len(tokens)
+
+        if ncols in (5, 8):
+            return "atomic"
+        if ncols in (7, 10):
+            return "full"
         if ncols in (6, 9):
-            # Check if token[2] is likely a float charge vs int type
             try:
-                # In 'charge': id type q x y z -> token[1] is type (int), token[2] is charge (float)
-                # In 'molecular': id mol type x y z -> token[1] is mol (int), token[2] is type (int)
-                val2 = float(tokens[2])
-                # If val2 has a decimal part or is negative, it's very likely a charge
-                if ("." in tokens[2] and not tokens[2].endswith(".0")) or val2 < 0:
+                value = float(tokens[2])
+                if ("." in tokens[2] and not tokens[2].endswith(".0")) or value < 0:
                     return "charge"
-                # If num_bonds > 0, molecular is standard
-                if num_bonds > 0:
-                    return "molecular"
             except ValueError:
                 pass
             return "molecular"
 
-        # Fallback default
-        if num_bonds > 0:
-            return "full"
-        return "atomic"
+        return "full" if num_bonds > 0 else "atomic"
+
+    # ------------------------------------------------------------------
+    # Dump trajectory
+    # ------------------------------------------------------------------
+    @classmethod
+    def _parse_dump(cls, filepath: str) -> LammpsDataInfo:
+        info = LammpsDataInfo(filepath=os.path.abspath(filepath), file_type="dump")
+
+        pending: Optional[str] = None
+        num_atoms: Optional[int] = None
+        box_rows: List[List[float]] = []
+        columns: List[str] = []
+        type_index: Optional[int] = None
+        element_index: Optional[int] = None
+        remaining_atoms = 0
+        sampled = 0
+        type_elements: Dict[int, str] = {}
+        seen_types: Set[int] = set()
+
+        for raw_line in cls._iter_lines(filepath):
+            text = raw_line.strip()
+            if not text:
+                continue
+
+            if text.upper().startswith("ITEM:"):
+                item = text[5:].strip()
+                upper_item = item.upper()
+
+                if upper_item.startswith("TIMESTEP"):
+                    pending = "timestep"
+                elif upper_item.startswith("NUMBER OF ATOMS"):
+                    pending = "natoms"
+                elif upper_item.startswith("BOX BOUNDS"):
+                    pending = "box"
+                    box_rows = []
+                elif upper_item.startswith("ATOMS"):
+                    pending = "atoms"
+                    parts = item.split()
+                    columns = [part.strip().lower() for part in parts[1:]]
+                    type_index = columns.index("type") if "type" in columns else None
+                    element_index = columns.index("element") if "element" in columns else None
+                    remaining_atoms = num_atoms or 0
+                    sampled = 0
+                else:
+                    pending = None
+                continue
+
+            if pending == "timestep":
+                if not info.title:
+                    info.title = f"起始步 {text}"
+                pending = None
+                continue
+
+            if pending == "natoms":
+                try:
+                    info.num_atoms = int(text.split()[0])
+                except (ValueError, IndexError):
+                    pass
+                num_atoms = info.num_atoms
+                pending = None
+                continue
+
+            if pending == "box":
+                try:
+                    values = [float(value) for value in text.split()[:3]]
+                except ValueError:
+                    continue
+                if values:
+                    box_rows.append(values)
+                if len(box_rows) == 3:
+                    info.box = cls._parse_bounds_block(box_rows)
+                    pending = None
+                continue
+
+            if pending == "atoms":
+                if remaining_atoms <= 0 and num_atoms:
+                    break
+                tokens = text.split()
+                if type_index is not None and type_index < len(tokens):
+                    try:
+                        type_id = int(tokens[type_index])
+                    except ValueError:
+                        type_id = None
+                    if type_id is not None and type_id > 0:
+                        seen_types.add(type_id)
+                        if element_index is not None and element_index < len(tokens):
+                            symbol = tokens[element_index].strip().capitalize()
+                            if symbol in ELEMENTS_DB and type_id not in type_elements:
+                                type_elements[type_id] = symbol
+
+                remaining_atoms -= 1
+                sampled += 1
+                if num_atoms and remaining_atoms <= 0:
+                    break
+                if sampled >= cls.MAX_ATOM_SAMPLE:
+                    break
+
+        if not info.num_atoms and not seen_types:
+            raise LammpsFileError(
+                "无法识别该文件：既不是 LAMMPS data 文件，也不是 LAMMPS dump 轨迹文件。"
+            )
+
+        for type_id in sorted(seen_types):
+            element = type_elements.get(type_id, "")
+            if element:
+                element_info = ELEMENTS_DB[element]
+                atom_type = AtomTypeData(
+                    type_id=type_id,
+                    mass=element_info.mass,
+                    comment="",
+                    element=element,
+                    element_info=element_info,
+                    radius=element_info.vdw_radius,
+                    color=element_info.hex_color,
+                )
+            else:
+                atom_type = AtomTypeData(
+                    type_id=type_id,
+                    mass=0.0,
+                    comment="",
+                    element="X",
+                    element_info=UNKNOWN_ELEMENT,
+                    radius=UNKNOWN_ELEMENT.vdw_radius,
+                    color=cls._palette_color(type_id),
+                )
+            info.atom_types[type_id] = atom_type
+
+        info.num_atom_types = len(info.atom_types)
+        info.num_bonds = 0
+        info.atom_style_detected = False
+        return info

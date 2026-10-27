@@ -35,32 +35,45 @@ def save_config(data: dict) -> None:
         pass
 
 
+def _find_in_vmd_folders(root: str) -> List[str]:
+    """Finds vmd.exe inside immediate sub-folders such as ``VMD2.0``."""
+    results: List[str] = []
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return results
+    for entry in sorted(entries, reverse=True):
+        if not entry.lower().startswith("vmd"):
+            continue
+        candidate = os.path.join(root, entry, "vmd.exe")
+        if os.path.isfile(candidate):
+            results.append(candidate)
+    return results
+
+
 def find_vmd_executable(custom_path: Optional[str] = None) -> Optional[str]:
     """
     Finds the VMD executable path.
     1. Checks custom_path if provided.
     2. Checks saved configuration.
     3. Checks PATH environment.
-    4. Checks standard Windows / Unix installation directories.
+    4. Scans common Windows installation directories.
     """
     if custom_path and os.path.isfile(custom_path):
         save_config({"vmd_path": custom_path})
         return custom_path
 
-    # Check saved config
     cfg = load_config()
     saved = cfg.get("vmd_path")
     if saved and os.path.isfile(saved):
         return saved
 
-    # Check system PATH
     in_path = shutil.which("vmd") or shutil.which("vmd.exe")
     if in_path:
         return in_path
 
-    # Standard candidate directories
     candidates: List[str] = []
-    
+
     if sys.platform.startswith("win"):
         program_dirs = [
             os.environ.get("ProgramFiles", r"C:\Program Files"),
@@ -70,48 +83,57 @@ def find_vmd_executable(custom_path: Optional[str] = None) -> Optional[str]:
             r"D:\Program Files",
             r"D:\Program Files (x86)",
             r"E:\Program Files",
+            r"E:\Program Files (x86)",
             r"C:\VMD",
             r"D:\VMD",
-            r"E:\VMD"
+            r"E:\VMD",
         ]
-        
+
+        scan_roots: List[str] = []
         for pdir in program_dirs:
             if not os.path.isdir(pdir):
                 continue
-            # Look for University of Illinois\VMD*
-            uillinois = os.path.join(pdir, "University of Illinois")
-            if os.path.isdir(uillinois):
-                try:
-                    for folder in sorted(os.listdir(uillinois), reverse=True):
-                        if folder.lower().startswith("vmd"):
-                            vmd_bin = os.path.join(uillinois, folder, "vmd.exe")
-                            if os.path.isfile(vmd_bin):
-                                candidates.append(vmd_bin)
-                except Exception:
-                    pass
-            # Direct VMD folders
-            vmd_bin = os.path.join(pdir, "vmd.exe")
-            if os.path.isfile(vmd_bin):
-                candidates.append(vmd_bin)
+            uiuc = os.path.join(pdir, "University of Illinois")
+            if os.path.isdir(uiuc):
+                candidates.extend(_find_in_vmd_folders(uiuc))
+            candidates.extend(_find_in_vmd_folders(pdir))
+            direct = os.path.join(pdir, "vmd.exe")
+            if os.path.isfile(direct):
+                candidates.append(direct)
+
+        for letter in "CDEFGH":
+            drive = f"{letter}:\\"
+            if not os.path.isdir(drive):
+                continue
+            scan_roots.extend(
+                [
+                    drive,
+                    os.path.join(drive, "software"),
+                    os.path.join(drive, "Program Files"),
+                ]
+            )
+        for root in scan_roots:
+            if os.path.isdir(root):
+                candidates.extend(_find_in_vmd_folders(root))
 
     elif sys.platform == "darwin":
-        candidates.extend([
-            "/Applications/VMD 1.9.4.app/Contents/vmd/vmd_MACOSX",
-            "/Applications/VMD 1.9.3.app/Contents/vmd/vmd_MACOSX",
-            "/usr/local/bin/vmd",
-            "/opt/homebrew/bin/vmd"
-        ])
+        candidates.extend(
+            [
+                "/Applications/VMD 1.9.4.app/Contents/vmd/vmd_MACOSX",
+                "/Applications/VMD 1.9.3.app/Contents/vmd/vmd_MACOSX",
+                "/usr/local/bin/vmd",
+                "/opt/homebrew/bin/vmd",
+            ]
+        )
     else:  # Linux
-        candidates.extend([
-            "/usr/local/bin/vmd",
-            "/usr/bin/vmd",
-            "/opt/vmd/bin/vmd"
-        ])
+        candidates.extend(
+            ["/usr/local/bin/vmd", "/usr/bin/vmd", "/opt/vmd/bin/vmd"]
+        )
 
-    for c in candidates:
-        if os.path.isfile(c):
-            save_config({"vmd_path": c})
-            return c
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            save_config({"vmd_path": candidate})
+            return candidate
 
     return None
 
